@@ -1,0 +1,47 @@
+import express from "express";
+import dotenv from "dotenv";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import axios from "axios";
+import { PrismaClient } from "@prisma/client";
+import feedRouter from "./routes/feed.js";
+
+dotenv.config();
+
+const app = express();
+const prisma = new PrismaClient();
+
+app.use(express.json());
+app.use(helmet());
+app.use(cors());
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  max: 60
+}));
+
+// Secret kontrolü (tüm /api altında)
+app.use("/api", (req, res, next) => {
+   console.log("GELEN SECRET:", req.headers["x-app-secret"]);
+  console.log("BEKLENEN:", process.env.APP_SECRET);
+  const secret = req.headers["x-app-secret"];
+  if (secret !== process.env.APP_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+});
+
+// Test
+app.get("/api/test", (req, res) => {
+  res.json({ message: "Backend çalışıyor knk!" });
+});
+
+//  Ana feed endpoint'i buraya bağlıyorum
+app.use("/api", feedRouter);
+
+
+
+
+app.listen(3000, () => {
+  console.log("Server running on http://localhost:3000");
+});
