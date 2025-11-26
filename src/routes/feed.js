@@ -61,7 +61,7 @@ router.get("/", async (req, res) => {
       },
     });
 
-    const movies = discoverRes.data.results.slice(0, 15); // ilk 15 film
+    const movies = discoverRes.data.results.slice(0, 50); // ilk 15 film
 
     const feed = [];
 
