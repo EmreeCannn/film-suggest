@@ -7,6 +7,8 @@ import axios from "axios";
 import { PrismaClient } from "@prisma/client";
 import feedRouter from "./routes/feed.js";
 
+import router from "./routes/ai.js";
+
 dotenv.config();
 
 const app = express();
@@ -20,6 +22,9 @@ app.use(rateLimit({
   max: 60
 }));
 
+
+
+app.use("/api/ai", router);
 // Secret kontrolü (tüm /api altında)
 app.use("/api", (req, res, next) => {
    console.log("GELEN SECRET:", req.headers["x-app-secret"]);
@@ -30,6 +35,8 @@ app.use("/api", (req, res, next) => {
   }
   next();
 });
+
+
 
 // Test
 app.get("/api/test", (req, res) => {
