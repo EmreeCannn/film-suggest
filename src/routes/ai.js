@@ -141,29 +141,26 @@ router.post("/feed", async (req, res) => {
     const normalizedPrompt = userPrompt.toLowerCase();
     const cacheKey = `ai_feed_${normalizedPrompt}`;
 
-    // 1) AI FEED CACHE
+    // 1) CACHE
     const cached = aiFeedCache.get(cacheKey);
     if (cached) {
       return res.json({ ...cached, cached: true });
     }
 
-    // 2) IN-FLIGHT FEED (aynı prompt için bir çağrı zaten varsa)
+    // 2) IN-FLIGHT
     if (inFlightFeeds.has(cacheKey)) {
       const shared = await inFlightFeeds.get(cacheKey);
       return res.json({ ...shared, cached: true, shared: true });
     }
 
-    // 3) İlk defa bu prompt için feed üretiyoruz
+    // 3) Yeni feed oluştur
     const feedPromise = (async () => {
-      // 3.1 AI'dan filtre al
+      // 3.1 AI'dan filtreleri al
       const { filters } = await getFiltersForPrompt(userPrompt);
-
       const category = (filters.category || "action").toLowerCase();
 
-      // 3.2 Arkada kendi feed endpoint'ini çağır
-      // Not: Secret middleware için x-app-secret ekliyoruz
+      // 3.2 Arka planda feed çek
       const baseUrl = process.env.INTERNAL_BASE_URL || "http://localhost:3000";
-
       const feedResp = await axios.get(`${baseUrl}/api`, {
         params: { category },
         headers: {
@@ -173,7 +170,7 @@ router.post("/feed", async (req, res) => {
 
       let movies = feedResp.data.feed || [];
 
-      // 3.3 AI filtrelerini TMDB feed'e uygula
+      // 3.3 AI filtrelerini uygula
       if (filters.minRating) {
         movies = movies.filter((m) => (m.rating || 0) >= filters.minRating);
       }
@@ -195,7 +192,7 @@ router.post("/feed", async (req, res) => {
         );
       }
 
-      if (filters.genres && Array.isArray(filters.genres) && filters.genres.length > 0) {
+      if (filters.genres && Array.isArray(filters.genres)) {
         const wanted = filters.genres.map((g) => g.toLowerCase());
         movies = movies.filter((m) => {
           const movieGenres = (m.genres || []).map((g) => g.toLowerCase());
@@ -203,12 +200,59 @@ router.post("/feed", async (req, res) => {
         });
       }
 
+      // -------------------------
+      // 3.4 AGENT MESAJI EKLİYORUZ 🔥
+      // -------------------------
+
+      let agentMessage = "Film önerileri hazır knk.";
+
+      if (movies.length > 0) {
+        const topMovies = movies.slice(0, 5).map((m) => m.title).join(", ");
+
+        // AI'ya feed verip bir özet cümle ürettirelim
+        try {
+          const agentResp = await axios.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            {
+              model: "gpt-4o-mini",
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "Sen bir film öneri asistanısın. Kullanıcının istediği türe göre kısa, akıcı bir öneri cümlesi yaz. Maksimum 2 cümle."
+                },
+                {
+                  role: "user",
+                  content:
+                    `Kullanıcı şunu istedi: "${userPrompt}".` +
+                    ` Ona uygun filmler: ${topMovies}.`
+                }
+              ]
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.OPEN_ROUTER_API}`,
+                "Content-Type": "application/json",
+              },
+            }
+          );
+
+          agentMessage =
+            agentResp.data?.choices?.[0]?.message?.content ||
+            agentMessage;
+        } catch (e) {
+          console.error("Agent message error:", e.message);
+        }
+      }
+
+      // Response
       const responseBody = {
         prompt: userPrompt,
         filters,
+        agent: agentMessage,   // 🔥 YENİ EKLEDİĞİMİZ KISIM
         category,
         count: movies.length,
-        feed: movies, // 🔥 TMDB feed ile AYNI format (videoUrl + videoSource dahil)
+        feed: movies,
       };
 
       aiFeedCache.set(cacheKey, responseBody);
@@ -218,14 +262,15 @@ router.post("/feed", async (req, res) => {
     })();
 
     inFlightFeeds.set(cacheKey, feedPromise);
-
     const finalFeed = await feedPromise;
 
     return res.json({ ...finalFeed, cached: false });
+
   } catch (err) {
     console.error("AI /feed ERROR:", err.response?.data || err.message);
     return res.status(500).json({ error: "AI feed hata verdi knk" });
   }
 });
+
 
 export default router;

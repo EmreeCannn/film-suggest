@@ -6,8 +6,9 @@ import rateLimit from "express-rate-limit";
 import axios from "axios";
 import { PrismaClient } from "@prisma/client";
 import feedRouter from "./routes/feed.js";
-
+import allRouter from "./routes/all.js"
 import router from "./routes/ai.js";
+import trendingRoute from "./routes/trending.js";
 
 dotenv.config();
 
@@ -46,8 +47,8 @@ app.get("/api/test", (req, res) => {
 //  Ana feed endpoint'i buraya bağlıyorum
 app.use("/api", feedRouter);
 
-
-
+app.use("/api/all", allRouter);
+app.use("/api/trending",trendingRoute);
 
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
