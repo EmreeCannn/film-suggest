@@ -1,258 +1,206 @@
 import express from "express";
 import axios from "axios";
+import { v4 as uuid } from "uuid";
 import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-/**
- * YouTube Embed → Watch URL
- */
-function convertToWatchUrl(youtubeIdOrUrl) {
-  if (!youtubeIdOrUrl) return null;
-
-  if (!youtubeIdOrUrl.includes("youtube")) {
-    return `https://www.youtube.com/watch?v=${youtubeIdOrUrl}`;
-  }
-
-  const match = youtubeIdOrUrl.match(/embed\/([^?]+)/);
-  if (match && match[1]) {
-    return `https://www.youtube.com/watch?v=${match[1]}`;
-  }
-
-  if (youtubeIdOrUrl.includes("watch?v=")) {
-    return youtubeIdOrUrl;
-  }
-
-  return null;
-}
-
-/**
- * Tek bir movieId'den full movie objesi üretir
- */
-async function buildMovieObject(movieId) {
+/* ============================================================
+   OPENROUTER CHAT HELPER
+============================================================ */
+async function askOpenRouter(
+  messages,
+  model = "openai/gpt-4o-mini"
+) {
   try {
-    // 1) Detaylar
-    const detailsRes = await tmdb.get(`/movie/${movieId}`);
-    const details = detailsRes.data;
-
-    // 2) Cast & Director
-    const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
-    const castRaw = creditsRes.data.cast.slice(0, 8);
-    const crewRaw = creditsRes.data.crew || [];
-
-    const cast = castRaw.map((p) => ({
-      name: p.name,
-      character: p.character,
-      profile: p.profile_path
-        ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
-        : null,
-    }));
-
-    const director =
-      crewRaw.find((p) => p.job === "Director")?.name || null;
-
-    // 3) Sertifika
-    const releaseRes = await tmdb.get(`/movie/${movieId}/release_dates`);
-    const certification =
-      releaseRes.data.results
-        ?.find((r) => r.iso_3166_1 === "US")
-        ?.release_dates?.[0]?.certification || null;
-
-    // 4) Fragman
-    const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
-    const videos = videoRes.data.results || [];
-
-    const tmdbVideo = videos.find(
-      (v) => v.site === "TMDB" && (v.url?.endsWith(".mp4") || false)
-    );
-
-    let videoUrl = null;
-    let videoSource = null;
-
-    if (tmdbVideo) {
-      videoUrl = tmdbVideo.url;
-      videoSource = "tmdb_mp4";
-    } else {
-      const yt = videos.find(
-        (v) => v.site === "YouTube" && v.type === "Trailer"
-      );
-      if (yt) {
-        videoUrl = convertToWatchUrl(yt.key);
-        videoSource = "youtube";
-      }
-    }
-
-    // 5) Watch providers (Netflix, Prime, Disney+, vs.)
-    const providerRes = await tmdb.get(`/movie/${movieId}/watch/providers`);
-    const usProviders = providerRes.data.results?.US || {};
-
-    function mapProviders(list, type) {
-      if (!list) return [];
-      return list.map((p) => ({
-        name: p.provider_name,
-        type, // subscription / buy / rent / ads
-        logo: p.logo_path
-          ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
-          : null,
-      }));
-    }
-
-    const platforms = [
-      ...mapProviders(usProviders.flatrate, "subscription"),
-      ...mapProviders(usProviders.buy, "buy"),
-      ...mapProviders(usProviders.rent, "rent"),
-      ...mapProviders(usProviders.ads, "ads"),
-    ];
-
-    const platformLink = usProviders.link || null;
-
-    return {
-      id: movieId,
-      title: details.title,
-      overview: details.overview,
-      year: details.release_date?.split("-")[0] || "N/A",
-      rating: details.vote_average,
-      runtime: details.runtime,
-      certification,
-      director,
-      genres: details.genres?.map((g) => g.name) || [],
-      poster: details.poster_path
-        ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
-        : null,
-      backdrop: details.backdrop_path
-        ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}`
-        : null,
-      cast,
-      platforms,
-      platformLink,
-      videoUrl,
-      videoSource,
-    };
-  } catch (err) {
-    console.error("buildMovieObject error:", err.message);
-    return null;
-  }
-}
-
-/**
- * AI'dan film isimleriyle plan almamız için prompt
- */
-const SYSTEM_PROMPT = `
-Sen bir film öneri yapay zekasısın. Kullanıcıyla Türkçe konuş, samimi ol, "kanka" tonunda yazabilirsin ama aşırı abartma.
-
-Cevabın HER ZAMAN sadece şu formatta olsun:
-
-{
-  "reply": "kullanıcıya yazacağın sohbet mesajı (Türkçe, kısa, maksimum 3-4 cümle)",
-  "movies": ["Film Adı 1", "Film Adı 2", "Film Adı 3"]
-}
-
-Kurallar:
-- "movies" dizisinde en fazla 5 film olsun.
-- 1 ile 5 arası film önerebilirsin, ama asla 5'ten fazla olmasın.
-- Filmler mutlaka GERÇEK sinema filmleri olsun, uydurma isim yazma.
-- Kullanıcının isteğiyle tür, ton ve dönem açısından alakalı filmler seç.
-- Film isimlerini sadece orijinal isimleriyle yaz (İngilizce veya TMDB'de geçtiği haliyle).
-- JSON dışında hiçbir şey yazma, açıklama ekleme, markdown kullanma.
-`;
-
-/**
- * POST /api/ai/feed
- * body: { message: "..." }
- */
-router.post("/feed", async (req, res) => {
-  try {
-    const userMessage = req.body.message;
-    if (!userMessage) {
-      return res.status(400).json({ error: "message lazım knk" });
-    }
-
-    if (!process.env.OPENROUTER_API_KEY) {
-      return res.status(500).json({ error: "OPENROUTER_API_KEY yok knk" });
-    }
-
-    // 1) OpenRouter'dan AI cevabı ve film isimlerini al
-    const aiRes = await axios.post(
+    const r = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
-        model: "gpt-4o-mini", // istersen burayı değiştiririz
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userMessage },
-        ],
-        max_tokens: 400,
-        temperature: 0.8,
+        model,
+        messages,
+        max_tokens: 200
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          "Authorization": `Bearer ${process.env.OPEN_ROUTER_API}`,
           "Content-Type": "application/json",
-        },
+          "HTTP-Referer": "https://film-suggest.vercel.app",
+          "X-Title": "FilmSuggest AI"
+        }
       }
     );
 
-    const rawContent = aiRes.data?.choices?.[0]?.message?.content;
-    let replyText = "";
-    let movieTitles = [];
+    return r.data.choices?.[0]?.message?.content || "No response from AI.";
+  } catch (err) {
+    console.error("OpenRouter Error:", err.response?.data || err.message);
+    return "AI error knk.";
+  }
+}
 
-    try {
-      const parsed = JSON.parse(rawContent);
-      replyText = parsed.reply || "";
-      if (Array.isArray(parsed.movies)) {
-        movieTitles = parsed.movies
-          .filter((m) => typeof m === "string")
-          .slice(0, 5);
+/* ============================================================
+   GET TRAILER FOR MOVIE
+============================================================ */
+async function getTrailer(movieId) {
+  try {
+    const r = await tmdb.get(`/movie/${movieId}/videos`);
+
+    const yt = r.data.results.find(
+      (v) => v.site === "YouTube" && v.type === "Trailer"
+    );
+
+    if (!yt) return { videoUrl: null, videoSource: null };
+
+    return {
+      videoUrl: `https://www.youtube.com/watch?v=${yt.key}`,
+      videoSource: "youtube"
+    };
+  } catch {
+    return { videoUrl: null, videoSource: null };
+  }
+}
+
+/* ============================================================
+   TMDB SEARCH + TRAILER + FORCE 5 RESULTS
+============================================================ */
+async function searchTMDBFull(query) {
+  try {
+    const r = await tmdb.get("/search/movie", {
+      params: {
+        query,
+        include_adult: false
       }
-    } catch (err) {
-      console.error("AI JSON parse error:", err.message);
-      // Fallback: düz text gibi davran
-      replyText = rawContent || "";
-      movieTitles = [];
+    });
+
+    let results = r.data.results;
+
+    // Eğer 5 film yoksa → trend ekleyip tamamla
+    if (results.length < 5) {
+      const trend = await tmdb.get("/trending/movie/day");
+      results = [...results, ...trend.data.results].slice(0, 5);
+    } else {
+      results = results.slice(0, 5);
     }
 
-    // 2) Eğer film listesi boşsa, kullanıcıya sadece mesaj dön
-    if (!movieTitles.length) {
-      return res.json({
-        message: replyText || "Knk şu an net bir film seçemedim ama biraz daha detay verirsen sana güzel liste yaparım.",
-        count: 0,
-        movies: [],
+    // Her film için trailer getir
+    const movies = [];
+    for (const m of results) {
+      const trailer = await getTrailer(m.id);
+
+      movies.push({
+        id: m.id,
+        title: m.title,
+        overview: m.overview,
+        year: m.release_date?.split("-")[0] || null,
+
+        poster: m.poster_path
+          ? `https://image.tmdb.org/t/p/w500${m.poster_path}`
+          : null,
+
+        backdrop: m.backdrop_path
+          ? `https://image.tmdb.org/t/p/w780${m.backdrop_path}`
+          : null,
+
+        videoUrl: trailer.videoUrl,
+        videoSource: trailer.videoSource
       });
     }
 
-    // 3) Her film adı için TMDB'den en iyi eşleşen filmi bul
-    const movieResults = [];
-
-    for (const title of movieTitles) {
-      try {
-        const searchRes = await tmdb.get("/search/movie", {
-          params: {
-            query: title,
-            include_adult: false,
-            page: 1,
-          },
-        });
-
-        const first = searchRes.data.results?.[0];
-        if (!first) continue;
-
-        const fullMovie = await buildMovieObject(first.id);
-        if (fullMovie) {
-          movieResults.push(fullMovie);
-        }
-      } catch (err) {
-        console.error("TMDB search error for title:", title, err.message);
-      }
-    }
-
-    return res.json({
-      message: replyText,
-      count: movieResults.length,
-      movies: movieResults,
-    });
+    return movies;
   } catch (err) {
-    console.error("AI FEED ERROR:", err.message);
-    return res.status(500).json({ error: "AI feed hata verdi knk" });
+    console.error("TMDB Search Error:", err.message);
+    return [];
   }
+}
+
+/* ============================================================
+   1) START AI CHAT SESSION
+============================================================ */
+router.post("/session/start", (req, res) => {
+  const { movieId } = req.body;
+
+  if (!movieId) return res.status(400).json({ error: "movieId is required" });
+
+  const sessionId = uuid();
+
+  sessions[sessionId] = {
+    movieId,
+    history: []
+  };
+
+  return res.json({
+    sessionId,
+    aiMessage:
+      "Chat session started knk. Ask me anything about this movie in English."
+  });
+});
+
+/* ============================================================
+   2) CONTINUE CHAT
+============================================================ */
+router.post("/session/message", async (req, res) => {
+  const { sessionId, message } = req.body;
+
+  if (!sessionId || !message)
+    return res.status(400).json({ error: "sessionId and message are required" });
+
+  const session = sessions[sessionId];
+  if (!session) return res.status(404).json({ error: "Session not found" });
+
+  const msgs = [
+    {
+      role: "system",
+      content:
+        "You are a friendly movie assistant. Always respond in English. User calls you 'knk'."
+    }
+  ];
+
+  session.history.push({ role: "user", content: message });
+  msgs.push(...session.history);
+
+  const response = await askOpenRouter(msgs);
+
+  session.history.push({ role: "assistant", content: response });
+
+  return res.json({
+    aiMessage: response
+  });
+});
+
+/* ============================================================
+   3) RECOMMEND MOVIES (NO TALKING — ONLY RESULTS)
+============================================================ */
+router.post("/recommend", async (req, res) => {
+  const { message } = req.body;
+
+  if (!message)
+    return res.status(400).json({ error: "message is required" });
+
+  // Step 1: AI → convert request to simple keyword
+  const prompt = `
+Convert the user's request into a simple English movie search keyword.
+
+Example:
+User: "knk I want scary psychological thrillers"
+Output: "psychological thriller"
+
+User Input: "${message}"
+Return ONLY the keyword.
+`;
+
+  const aiQuery = await askOpenRouter(
+    [{ role: "user", content: prompt }],
+    "openai/gpt-4o-mini"
+  );
+
+  // Step 2: TMDB search + trailers + ensure 5 results
+  const movies = await searchTMDBFull(aiQuery);
+
+  return res.json({
+    query: message,
+    searchQuery: aiQuery,
+    count: movies.length,
+    movies
+  });
 });
 
 export default router;
