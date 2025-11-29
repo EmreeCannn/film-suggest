@@ -1,20 +1,10 @@
 import express from "express";
-import NodeCache from "node-cache";
 import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-// Cache 5 dakika
-const allCache = new NodeCache({
-  stdTTL: 300,
-  checkperiod: 320,
-});
-
-// In-flight tekilleştirme
-const inFlightAll = new Map();
-
 /**
- * YouTube Embed → Watch URL
+ * YouTube embed → watch
  */
 function convertToWatchUrl(youtubeIdOrUrl) {
   if (!youtubeIdOrUrl) return null;
@@ -35,170 +25,153 @@ function convertToWatchUrl(youtubeIdOrUrl) {
   return null;
 }
 
+
+/**
+ * Full movie builder — JSON formatı korunmuş halde
+ */
+async function buildMovieObject(movieId) {
+  try {
+    // 1) DETAILS
+    const detailsRes = await tmdb.get(`/movie/${movieId}`);
+    const details = detailsRes.data;
+
+    // 2) CAST
+    const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
+    const castRaw = creditsRes.data.cast.slice(0, 8);
+    const cast = castRaw.map(p => ({
+      name: p.name,
+      character: p.character,
+      profile: p.profile_path
+        ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
+        : null
+    }));
+
+    // 3) TRAILER (MP4 → YouTube fallback)
+    const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
+    const videos = videoRes.data.results || [];
+
+    const tmdbVideo = videos.find(
+      v => v.site === "TMDB" && v.url?.endsWith(".mp4")
+    );
+
+    let videoUrl = null;
+    let videoSource = null;
+
+    if (tmdbVideo) {
+      videoUrl = tmdbVideo.url;
+      videoSource = "tmdb_mp4";
+    } else {
+      const yt = videos.find(
+        v => v.site === "YouTube" && v.type === "Trailer"
+      );
+      if (yt) {
+        videoUrl = convertToWatchUrl(yt.key);
+        videoSource = "youtube";
+      }
+    }
+
+    // ❌ TikTok akışında video YOKSA film kullanılmaz
+    if (!videoUrl) return null;
+
+    // 4) WATCH PROVIDERS
+    const providerRes = await tmdb.get(`/movie/${movieId}/watch/providers`);
+    const us = providerRes.data.results?.US || {};
+
+    function mapProviders(list, type) {
+      if (!list) return [];
+      return list.map(p => ({
+        name: p.provider_name,
+        type,
+        logo: p.logo_path
+          ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
+          : null
+      }));
+    }
+
+    const platforms = [
+      ...mapProviders(us.flatrate, "subscription"),
+      ...mapProviders(us.buy, "buy"),
+      ...mapProviders(us.rent, "rent"),
+      ...mapProviders(us.ads, "ads")
+    ];
+
+    const platformLink = us.link || null;
+
+    // 5) RETURN — JSON formatı aynen korunuyor
+    return {
+      id: details.id,
+      title: details.title,
+      overview: details.overview,
+      year: details.release_date?.split("-")[0] || "N/A",
+      rating: details.vote_average,
+      runtime: details.runtime,
+      genres: details.genres?.map(g => g.name) || [],
+      poster: details.poster_path
+        ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
+        : null,
+      backdrop: details.backdrop_path
+        ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}`
+        : null,
+      cast,
+      platforms,
+      platformLink,
+      videoUrl,
+      videoSource
+    };
+
+  } catch (err) {
+    console.error("buildMovieObject error:", err.message);
+    return null;
+  }
+}
+
+
+
+/**
+ * GET /api/all — TikTok-ready global feed
+ */
 router.get("/", async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const cacheKey = `all_movies_${page}`;
+    let movies = [];
 
-    // CACHE
-    const cached = allCache.get(cacheKey);
-    if (cached) {
-      return res.json({ ...cached, cached: true });
-    }
-
-    // IN-FLIGHT
-    if (inFlightAll.has(cacheKey)) {
-      const shared = await inFlightAll.get(cacheKey);
-      return res.json({ ...shared, shared: true, cached: true });
-    }
-
-    const fetchPromise = (async () => {
-      // Tek seferde popüler filmleri al
-      const discoverRes = await tmdb.get("/discover/movie", {
+    // 1–10 page → 200 film
+    for (let page = 1; page <= 10; page++) {
+      const discover = await tmdb.get("/discover/movie", {
         params: {
           sort_by: "popularity.desc",
-          page: page,
-        },
+          page
+        }
       });
+      movies.push(...discover.data.results);
+    }
 
-      // İstersen 40'ı arttırabiliriz
-      const movies = discoverRes.data.results.slice(0, 40);
+    // Filtre: Çöp film alma
+    movies = movies.filter(m =>
+      m.poster_path &&
+      m.backdrop_path &&
+      m.overview &&
+      m.overview.length > 20 &&
+      m.vote_average > 0
+    );
 
-      const feed = [];
+    // TikTok akışı: Sadece videosu olan filmler
+    const finalMovies = [];
 
-      for (let movie of movies) {
-        const movieId = movie.id;
+    for (const m of movies) {
+      const full = await buildMovieObject(m.id);
+      if (full) finalMovies.push(full);
+      if (finalMovies.length >= 200) break;
+    }
 
-        // DETAILS
-        const detailsRes = await tmdb.get(`/movie/${movieId}`);
-        const details = detailsRes.data;
+    return res.json({
+      count: finalMovies.length,
+      movies: finalMovies
+    });
 
-        // CAST
-        const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
-        const castRaw = creditsRes.data.cast.slice(0, 10);
-        const crewRaw = creditsRes.data.crew;
-
-        const cast = castRaw.map((p) => ({
-          name: p.name,
-          character: p.character,
-          profile: p.profile_path
-            ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
-            : null,
-        }));
-
-        const director =
-          crewRaw.find((p) => p.job === "Director")?.name || null;
-
-        // CERTIFICATION
-        const releaseRes = await tmdb.get(`/movie/${movieId}/release_dates`);
-        const certification =
-          releaseRes.data.results
-            ?.find((r) => r.iso_3166_1 === "US")
-            ?.release_dates?.[0]?.certification || null;
-
-        // TRAILER
-        const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
-        const videos = videoRes.data.results || [];
-
-        const tmdbVideo = videos.find(
-          (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
-        );
-
-        let videoUrl = null;
-        let videoSource = null;
-
-        if (tmdbVideo) {
-          videoUrl = tmdbVideo.url;
-          videoSource = "tmdb_mp4";
-        } else {
-          const yt = videos.find(
-            (v) => v.site === "YouTube" && v.type === "Trailer"
-          );
-          if (yt) {
-            videoUrl = convertToWatchUrl(yt.key);
-            videoSource = "youtube";
-          }
-        }
-
-        // PROVIDERS
-        const providerRes = await tmdb.get(
-          `/movie/${movieId}/watch/providers`
-        );
-
-        const usProviders = providerRes.data.results?.US || {};
-
-        function mapProviders(list, type) {
-          if (!list) return [];
-          return list.map((p) => ({
-            name: p.provider_name,
-            type,
-            logo: p.logo_path
-              ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
-              : null,
-          }));
-        }
-
-        const platforms = [
-          ...mapProviders(usProviders.flatrate, "subscription"),
-          ...mapProviders(usProviders.buy, "buy"),
-          ...mapProviders(usProviders.rent, "rent"),
-          ...mapProviders(usProviders.ads, "ads"),
-        ];
-
-        const platformLink = usProviders.link || null;
-
-        feed.push({
-          id: movieId,
-          title: details.title,
-          overview: details.overview,
-          year: details.release_date?.split("-")[0] || "N/A",
-          rating: details.vote_average,
-          runtime: details.runtime,
-          certification,
-          director,
-
-          genres: details.genres?.map((g) => g.name) || [],
-
-          poster: details.poster_path
-            ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
-            : null,
-          backdrop: details.backdrop_path
-            ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}`
-            : null,
-
-          cast,
-          platforms,
-          platformLink,
-
-          videoUrl,
-          videoSource,
-        });
-      }
-
-      const result = {
-        mode: "all",
-        page: page,
-        totalPages: discoverRes.data.total_pages,
-        count: feed.length,
-        feed,
-      };
-
-      allCache.set(cacheKey, result);
-      inFlightAll.delete(cacheKey);
-
-      return result;
-    })();
-
-    inFlightAll.set(cacheKey, fetchPromise);
-
-    const fresh = await fetchPromise;
-
-    res.json({ ...fresh, cached: false });
   } catch (err) {
     console.error("ALL FEED ERROR:", err.message);
-    res.status(500).json({ error: "All feed hata verdi knk" });
+    return res.status(500).json({ error: "all hata verdi knk" });
   }
 });
 
 export default router;
-
