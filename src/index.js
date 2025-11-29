@@ -10,6 +10,7 @@ import allRouter from "./routes/all.js"
 import router from "./routes/ai.js";
 import trendingRoute from "./routes/trending.js";
 import searchRouter from "./routes/search.js";
+import aiMovieChat from "./routes/aiMovieChat.js";
 dotenv.config();
 
 const app = express();
@@ -50,6 +51,7 @@ app.use("/api", feedRouter);
 app.use("/api/all", allRouter);
 app.use("/api/trending",trendingRoute);
 app.use("/api/search",searchRouter);
+app.use("/api/ai", aiMovieChat);
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
 });

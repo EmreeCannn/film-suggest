@@ -1,276 +1,258 @@
 import express from "express";
 import axios from "axios";
-import NodeCache from "node-cache";
+import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-// AI filtre cache'i (prompt -> filters)
-const aiCache = new NodeCache({
-  stdTTL: 300,    // 5 dk
-  checkperiod: 320,
-});
+/**
+ * YouTube Embed → Watch URL
+ */
+function convertToWatchUrl(youtubeIdOrUrl) {
+  if (!youtubeIdOrUrl) return null;
 
-// AI + Feed birleşmiş result cache'i (prompt -> feed)
-const aiFeedCache = new NodeCache({
-  stdTTL: 300,
-  checkperiod: 320,
-});
+  if (!youtubeIdOrUrl.includes("youtube")) {
+    return `https://www.youtube.com/watch?v=${youtubeIdOrUrl}`;
+  }
 
-// Aynı anda gelen istekleri tek çağrıya düşürmek için
-const inFlightFilters = new Map();
-const inFlightFeeds = new Map();
+  const match = youtubeIdOrUrl.match(/embed\/([^?]+)/);
+  if (match && match[1]) {
+    return `https://www.youtube.com/watch?v=${match[1]}`;
+  }
+
+  if (youtubeIdOrUrl.includes("watch?v=")) {
+    return youtubeIdOrUrl;
+  }
+
+  return null;
+}
 
 /**
- * Ortak helper: prompt'a göre AI'dan filtre al
- * Hem cache'li hem concurrency kontrollü
+ * Tek bir movieId'den full movie objesi üretir
  */
-async function getFiltersForPrompt(userPrompt) {
-  const normalizedPrompt = userPrompt.toLowerCase().trim();
-  const cacheKey = `ai_filters_${normalizedPrompt}`;
+async function buildMovieObject(movieId) {
+  try {
+    // 1) Detaylar
+    const detailsRes = await tmdb.get(`/movie/${movieId}`);
+    const details = detailsRes.data;
 
-  // 1) Cache varsa
-  const cached = aiCache.get(cacheKey);
-  if (cached) {
-    return { ...cached, cached: true, shared: false };
+    // 2) Cast & Director
+    const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
+    const castRaw = creditsRes.data.cast.slice(0, 8);
+    const crewRaw = creditsRes.data.crew || [];
+
+    const cast = castRaw.map((p) => ({
+      name: p.name,
+      character: p.character,
+      profile: p.profile_path
+        ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
+        : null,
+    }));
+
+    const director =
+      crewRaw.find((p) => p.job === "Director")?.name || null;
+
+    // 3) Sertifika
+    const releaseRes = await tmdb.get(`/movie/${movieId}/release_dates`);
+    const certification =
+      releaseRes.data.results
+        ?.find((r) => r.iso_3166_1 === "US")
+        ?.release_dates?.[0]?.certification || null;
+
+    // 4) Fragman
+    const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
+    const videos = videoRes.data.results || [];
+
+    const tmdbVideo = videos.find(
+      (v) => v.site === "TMDB" && (v.url?.endsWith(".mp4") || false)
+    );
+
+    let videoUrl = null;
+    let videoSource = null;
+
+    if (tmdbVideo) {
+      videoUrl = tmdbVideo.url;
+      videoSource = "tmdb_mp4";
+    } else {
+      const yt = videos.find(
+        (v) => v.site === "YouTube" && v.type === "Trailer"
+      );
+      if (yt) {
+        videoUrl = convertToWatchUrl(yt.key);
+        videoSource = "youtube";
+      }
+    }
+
+    // 5) Watch providers (Netflix, Prime, Disney+, vs.)
+    const providerRes = await tmdb.get(`/movie/${movieId}/watch/providers`);
+    const usProviders = providerRes.data.results?.US || {};
+
+    function mapProviders(list, type) {
+      if (!list) return [];
+      return list.map((p) => ({
+        name: p.provider_name,
+        type, // subscription / buy / rent / ads
+        logo: p.logo_path
+          ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
+          : null,
+      }));
+    }
+
+    const platforms = [
+      ...mapProviders(usProviders.flatrate, "subscription"),
+      ...mapProviders(usProviders.buy, "buy"),
+      ...mapProviders(usProviders.rent, "rent"),
+      ...mapProviders(usProviders.ads, "ads"),
+    ];
+
+    const platformLink = usProviders.link || null;
+
+    return {
+      id: movieId,
+      title: details.title,
+      overview: details.overview,
+      year: details.release_date?.split("-")[0] || "N/A",
+      rating: details.vote_average,
+      runtime: details.runtime,
+      certification,
+      director,
+      genres: details.genres?.map((g) => g.name) || [],
+      poster: details.poster_path
+        ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
+        : null,
+      backdrop: details.backdrop_path
+        ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}`
+        : null,
+      cast,
+      platforms,
+      platformLink,
+      videoUrl,
+      videoSource,
+    };
+  } catch (err) {
+    console.error("buildMovieObject error:", err.message);
+    return null;
   }
+}
 
-  // 2) Aynı prompt için AI çağrısı zaten çalışıyorsa, onu bekle
-  if (inFlightFilters.has(cacheKey)) {
-    const sharedResp = await inFlightFilters.get(cacheKey);
-    return { ...sharedResp, cached: true, shared: true };
-  }
+/**
+ * AI'dan film isimleriyle plan almamız için prompt
+ */
+const SYSTEM_PROMPT = `
+Sen bir film öneri yapay zekasısın. Kullanıcıyla Türkçe konuş, samimi ol, "kanka" tonunda yazabilirsin ama aşırı abartma.
 
-  // 3) İlk biz istiyoruz → OpenRouter'a git
-  const aiPromise = (async () => {
-    const openRouterResp = await axios.post(
+Cevabın HER ZAMAN sadece şu formatta olsun:
+
+{
+  "reply": "kullanıcıya yazacağın sohbet mesajı (Türkçe, kısa, maksimum 3-4 cümle)",
+  "movies": ["Film Adı 1", "Film Adı 2", "Film Adı 3"]
+}
+
+Kurallar:
+- "movies" dizisinde en fazla 5 film olsun.
+- 1 ile 5 arası film önerebilirsin, ama asla 5'ten fazla olmasın.
+- Filmler mutlaka GERÇEK sinema filmleri olsun, uydurma isim yazma.
+- Kullanıcının isteğiyle tür, ton ve dönem açısından alakalı filmler seç.
+- Film isimlerini sadece orijinal isimleriyle yaz (İngilizce veya TMDB'de geçtiği haliyle).
+- JSON dışında hiçbir şey yazma, açıklama ekleme, markdown kullanma.
+`;
+
+/**
+ * POST /api/ai/feed
+ * body: { message: "..." }
+ */
+router.post("/feed", async (req, res) => {
+  try {
+    const userMessage = req.body.message;
+    if (!userMessage) {
+      return res.status(400).json({ error: "message lazım knk" });
+    }
+
+    if (!process.env.OPENROUTER_API_KEY) {
+      return res.status(500).json({ error: "OPENROUTER_API_KEY yok knk" });
+    }
+
+    // 1) OpenRouter'dan AI cevabı ve film isimlerini al
+    const aiRes = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
-        model: "gpt-4o-mini", // istersen başka modelle değiştir
+        model: "gpt-4o-mini", // istersen burayı değiştiririz
         messages: [
-          {
-            role: "system",
-            content:
-              "You are a movie recommendation filter builder for a TMDB-based trailer app. " +
-              "The user writes in natural language what they want to watch. " +
-              "You must respond ONLY with a valid JSON object, no explanation. " +
-              "Use this shape: " +
-              "{ category?: 'action'|'adventure'|'comedy'|'crime'|'drama'|'fantasy'|'horror'|'romance'|'scifi'|'thriller'," +
-              "  genres?: string[], minRating?: number, yearRange?: [number, number], maxRuntime?: number }"
-          },
-          {
-            role: "user",
-            content: userPrompt,
-          },
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userMessage },
         ],
+        max_tokens: 400,
+        temperature: 0.8,
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPEN_ROUTER_API}`,
+          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
           "Content-Type": "application/json",
         },
       }
     );
 
-    const rawContent =
-      openRouterResp.data?.choices?.[0]?.message?.content || "{}";
+    const rawContent = aiRes.data?.choices?.[0]?.message?.content;
+    let replyText = "";
+    let movieTitles = [];
 
-    let filters;
     try {
-      filters = JSON.parse(rawContent);
-    } catch (e) {
-      console.error("AI JSON parse error:", e.message, "raw:", rawContent);
-      // Parse edilemezse default
-      filters = { category: "action" };
+      const parsed = JSON.parse(rawContent);
+      replyText = parsed.reply || "";
+      if (Array.isArray(parsed.movies)) {
+        movieTitles = parsed.movies
+          .filter((m) => typeof m === "string")
+          .slice(0, 5);
+      }
+    } catch (err) {
+      console.error("AI JSON parse error:", err.message);
+      // Fallback: düz text gibi davran
+      replyText = rawContent || "";
+      movieTitles = [];
     }
 
-    const result = {
-      prompt: userPrompt,
-      filters,
-    };
-
-    aiCache.set(cacheKey, result);
-    inFlightFilters.delete(cacheKey);
-
-    return result;
-  })();
-
-  inFlightFilters.set(cacheKey, aiPromise);
-
-  const fresh = await aiPromise;
-  return { ...fresh, cached: false, shared: false };
-}
-
-/**
- * 1) Sadece filtre görmek için:
- * POST /api/ai/recommend
- * body: { "prompt": "..." }
- */
-router.post("/recommend", async (req, res) => {
-  try {
-    const userPrompt = (req.body.prompt || "").trim();
-    if (!userPrompt) {
-      return res.status(400).json({ error: "prompt lazım knk" });
-    }
-
-    const data = await getFiltersForPrompt(userPrompt);
-    return res.json(data);
-  } catch (err) {
-    console.error("AI /recommend ERROR:", err.response?.data || err.message);
-    return res.status(500).json({ error: "AI hata verdi knk" });
-  }
-});
-
-/**
- * 2) Asıl istediğimiz endpoint:
- * POST /api/ai/feed
- * body: { "prompt": "bugün hızlı tempolu bilim kurgu istiyorum" }
- *
- * Yaptığı:
- *  - AI'dan filtre alır (category, minRating vs.)
- *  - Arkada /api/feed?category=... çağırır
- *  - Feed içinden AI filtrelerine uyan filmleri süzer
- *  - Sana TMDB feed ile AYNI formatta (fragmanlı) film listesi döner
- */
-router.post("/feed", async (req, res) => {
-  try {
-    const userPrompt = (req.body.prompt || "").trim();
-    if (!userPrompt) {
-      return res.status(400).json({ error: "prompt lazım knk" });
-    }
-
-    const normalizedPrompt = userPrompt.toLowerCase();
-    const cacheKey = `ai_feed_${normalizedPrompt}`;
-
-    // 1) CACHE
-    const cached = aiFeedCache.get(cacheKey);
-    if (cached) {
-      return res.json({ ...cached, cached: true });
-    }
-
-    // 2) IN-FLIGHT
-    if (inFlightFeeds.has(cacheKey)) {
-      const shared = await inFlightFeeds.get(cacheKey);
-      return res.json({ ...shared, cached: true, shared: true });
-    }
-
-    // 3) Yeni feed oluştur
-    const feedPromise = (async () => {
-      // 3.1 AI'dan filtreleri al
-      const { filters } = await getFiltersForPrompt(userPrompt);
-      const category = (filters.category || "action").toLowerCase();
-
-      // 3.2 Arka planda feed çek
-      const baseUrl = process.env.INTERNAL_BASE_URL || "http://localhost:3000";
-      const feedResp = await axios.get(`${baseUrl}/api`, {
-        params: { category },
-        headers: {
-          "x-app-secret": process.env.APP_SECRET,
-        },
+    // 2) Eğer film listesi boşsa, kullanıcıya sadece mesaj dön
+    if (!movieTitles.length) {
+      return res.json({
+        message: replyText || "Knk şu an net bir film seçemedim ama biraz daha detay verirsen sana güzel liste yaparım.",
+        count: 0,
+        movies: [],
       });
+    }
 
-      let movies = feedResp.data.feed || [];
+    // 3) Her film adı için TMDB'den en iyi eşleşen filmi bul
+    const movieResults = [];
 
-      // 3.3 AI filtrelerini uygula
-      if (filters.minRating) {
-        movies = movies.filter((m) => (m.rating || 0) >= filters.minRating);
-      }
-
-      if (filters.yearRange && Array.isArray(filters.yearRange)) {
-        const [minYear, maxYear] = filters.yearRange;
-        movies = movies.filter((m) => {
-          const y = parseInt(m.year, 10);
-          if (Number.isNaN(y)) return false;
-          if (minYear && y < minYear) return false;
-          if (maxYear && y > maxYear) return false;
-          return true;
+    for (const title of movieTitles) {
+      try {
+        const searchRes = await tmdb.get("/search/movie", {
+          params: {
+            query: title,
+            include_adult: false,
+            page: 1,
+          },
         });
-      }
 
-      if (filters.maxRuntime) {
-        movies = movies.filter(
-          (m) => !m.runtime || m.runtime <= filters.maxRuntime
-        );
-      }
+        const first = searchRes.data.results?.[0];
+        if (!first) continue;
 
-      if (filters.genres && Array.isArray(filters.genres)) {
-        const wanted = filters.genres.map((g) => g.toLowerCase());
-        movies = movies.filter((m) => {
-          const movieGenres = (m.genres || []).map((g) => g.toLowerCase());
-          return movieGenres.some((mg) => wanted.includes(mg));
-        });
-      }
-
-      // -------------------------
-      // 3.4 AGENT MESAJI EKLİYORUZ 🔥
-      // -------------------------
-
-      let agentMessage = "Film önerileri hazır knk.";
-
-      if (movies.length > 0) {
-        const topMovies = movies.slice(0, 5).map((m) => m.title).join(", ");
-
-        // AI'ya feed verip bir özet cümle ürettirelim
-        try {
-          const agentResp = await axios.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            {
-              model: "gpt-4o-mini",
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "Sen bir film öneri asistanısın. Kullanıcının istediği türe göre kısa, akıcı bir öneri cümlesi yaz. Maksimum 2 cümle."
-                },
-                {
-                  role: "user",
-                  content:
-                    `Kullanıcı şunu istedi: "${userPrompt}".` +
-                    ` Ona uygun filmler: ${topMovies}.`
-                }
-              ]
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${process.env.OPEN_ROUTER_API}`,
-                "Content-Type": "application/json",
-              },
-            }
-          );
-
-          agentMessage =
-            agentResp.data?.choices?.[0]?.message?.content ||
-            agentMessage;
-        } catch (e) {
-          console.error("Agent message error:", e.message);
+        const fullMovie = await buildMovieObject(first.id);
+        if (fullMovie) {
+          movieResults.push(fullMovie);
         }
+      } catch (err) {
+        console.error("TMDB search error for title:", title, err.message);
       }
+    }
 
-      // Response
-      const responseBody = {
-        prompt: userPrompt,
-        filters,
-        agent: agentMessage,   // 🔥 YENİ EKLEDİĞİMİZ KISIM
-        category,
-        count: movies.length,
-        feed: movies,
-      };
-
-      aiFeedCache.set(cacheKey, responseBody);
-      inFlightFeeds.delete(cacheKey);
-
-      return responseBody;
-    })();
-
-    inFlightFeeds.set(cacheKey, feedPromise);
-    const finalFeed = await feedPromise;
-
-    return res.json({ ...finalFeed, cached: false });
-
+    return res.json({
+      message: replyText,
+      count: movieResults.length,
+      movies: movieResults,
+    });
   } catch (err) {
-    console.error("AI /feed ERROR:", err.response?.data || err.message);
+    console.error("AI FEED ERROR:", err.message);
     return res.status(500).json({ error: "AI feed hata verdi knk" });
   }
 });
-
 
 export default router;
