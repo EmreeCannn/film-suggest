@@ -4,111 +4,97 @@ import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-// Cache 5 dakika
-const allCache = new NodeCache({
-  stdTTL: 300,
-  checkperiod: 320,
+// Cache (aramalar sık tekrar edilir)
+const searchCache = new NodeCache({
+  stdTTL: 300,  // 5 dakika
+  checkperiod: 320
 });
 
 // In-flight tekilleştirme
-const inFlightAll = new Map();
+const inFlightSearch = new Map();
 
-/**
- * YouTube Embed → Watch URL
- */
-function convertToWatchUrl(youtubeIdOrUrl) {
-  if (!youtubeIdOrUrl) return null;
-
-  if (!youtubeIdOrUrl.includes("youtube")) {
-    return `https://www.youtube.com/watch?v=${youtubeIdOrUrl}`;
-  }
-
-  const match = youtubeIdOrUrl.match(/embed\/([^?]+)/);
-  if (match && match[1]) {
-    return `https://www.youtube.com/watch?v=${match[1]}`;
-  }
-
-  if (youtubeIdOrUrl.includes("watch?v=")) {
-    return youtubeIdOrUrl;
-  }
-
-  return null;
+/** YouTube embed → watch URL converter */
+function convertToWatchUrl(id) {
+  if (!id) return null;
+  return `https://www.youtube.com/watch?v=${id}`;
 }
 
 router.get("/", async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const cacheKey = `all_movies_${page}`;
+    const query = req.query.query;
 
-    // CACHE
-    const cached = allCache.get(cacheKey);
-    if (cached) {
-      return res.json({ ...cached, cached: true });
+    if (!query) {
+      return res.status(400).json({ error: "query param gerekli knk" });
     }
 
-    // IN-FLIGHT
-    if (inFlightAll.has(cacheKey)) {
-      const shared = await inFlightAll.get(cacheKey);
+    const cacheKey = `search_${query.toLowerCase()}`;
+
+    // Cache varsa direkt dön
+    const cached = searchCache.get(cacheKey);
+    if (cached) return res.json({ ...cached, cached: true });
+
+    // In-flight kontrol
+    if (inFlightSearch.has(cacheKey)) {
+      const shared = await inFlightSearch.get(cacheKey);
       return res.json({ ...shared, shared: true, cached: true });
     }
 
     const fetchPromise = (async () => {
-      // Tek seferde popüler filmleri al
-      const discoverRes = await tmdb.get("/discover/movie", {
+      // 1) TMDB arama
+      const searchRes = await tmdb.get("/search/movie", {
         params: {
-          sort_by: "popularity.desc",
-          page: page,
-        },
+          query,
+          include_adult: false,
+          page: 1
+        }
       });
 
-      // İstersen 40'ı arttırabiliriz
-      const movies = discoverRes.data.results.slice(0, 40);
+      const results = searchRes.data.results.slice(0, 20); // 20 sonuç yeter
 
       const feed = [];
 
-      for (let movie of movies) {
+      for (const movie of results) {
         const movieId = movie.id;
 
-        // DETAILS
+        // 2) Details
         const detailsRes = await tmdb.get(`/movie/${movieId}`);
         const details = detailsRes.data;
 
-        // CAST
+        // 3) Cast + Director
         const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
-        const castRaw = creditsRes.data.cast.slice(0, 10);
-        const crewRaw = creditsRes.data.crew;
+        const castRaw = creditsRes.data.cast.slice(0, 8);
+        const crew = creditsRes.data.crew;
 
-        const cast = castRaw.map((p) => ({
-          name: p.name,
-          character: p.character,
-          profile: p.profile_path
-            ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
+        const cast = castRaw.map((c) => ({
+          name: c.name,
+          character: c.character,
+          profile: c.profile_path
+            ? `https://image.tmdb.org/t/p/w500${c.profile_path}`
             : null,
         }));
 
         const director =
-          crewRaw.find((p) => p.job === "Director")?.name || null;
+          crew.find((c) => c.job === "Director")?.name || null;
 
-        // CERTIFICATION
+        // 4) Certification
         const releaseRes = await tmdb.get(`/movie/${movieId}/release_dates`);
         const certification =
-          releaseRes.data.results
-            ?.find((r) => r.iso_3166_1 === "US")
+          releaseRes.data.results?.find((r) => r.iso_3166_1 === "US")
             ?.release_dates?.[0]?.certification || null;
 
-        // TRAILER
+        // 5) Trailer
         const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
-        const videos = videoRes.data.results || [];
+        const videos = videoRes.data.results;
 
-        const tmdbVideo = videos.find(
+        const tmdbMp4 = videos.find(
           (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
         );
 
         let videoUrl = null;
         let videoSource = null;
 
-        if (tmdbVideo) {
-          videoUrl = tmdbVideo.url;
+        if (tmdbMp4) {
+          videoUrl = tmdbMp4.url;
           videoSource = "tmdb_mp4";
         } else {
           const yt = videos.find(
@@ -120,11 +106,10 @@ router.get("/", async (req, res) => {
           }
         }
 
-        // PROVIDERS
+        // 6) Platforms
         const providerRes = await tmdb.get(
           `/movie/${movieId}/watch/providers`
         );
-
         const usProviders = providerRes.data.results?.US || {};
 
         function mapProviders(list, type) {
@@ -156,9 +141,7 @@ router.get("/", async (req, res) => {
           runtime: details.runtime,
           certification,
           director,
-
           genres: details.genres?.map((g) => g.name) || [],
-
           poster: details.poster_path
             ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
             : null,
@@ -176,29 +159,27 @@ router.get("/", async (req, res) => {
       }
 
       const result = {
-        mode: "all",
-        page: page,
-        totalPages: discoverRes.data.total_pages,
+        query,
         count: feed.length,
-        feed,
+        results: feed,
       };
 
-      allCache.set(cacheKey, result);
-      inFlightAll.delete(cacheKey);
+      searchCache.set(cacheKey, result);
+      inFlightSearch.delete(cacheKey);
 
       return result;
     })();
 
-    inFlightAll.set(cacheKey, fetchPromise);
+    inFlightSearch.set(cacheKey, fetchPromise);
 
     const fresh = await fetchPromise;
 
-    res.json({ ...fresh, cached: false });
+    return res.json({ ...fresh, cached: false });
+
   } catch (err) {
-    console.error("ALL FEED ERROR:", err.message);
-    res.status(500).json({ error: "All feed hata verdi knk" });
+    console.error("SEARCH ERROR:", err.message);
+    return res.status(500).json({ error: "search hata verdi knk" });
   }
 });
 
 export default router;
-

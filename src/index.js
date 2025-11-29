@@ -9,7 +9,7 @@ import feedRouter from "./routes/feed.js";
 import allRouter from "./routes/all.js"
 import router from "./routes/ai.js";
 import trendingRoute from "./routes/trending.js";
-
+import searchRouter from "./routes/search.js";
 dotenv.config();
 
 const app = express();
@@ -49,7 +49,7 @@ app.use("/api", feedRouter);
 
 app.use("/api/all", allRouter);
 app.use("/api/trending",trendingRoute);
-
+app.use("/api/search",searchRouter);
 app.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
 });
