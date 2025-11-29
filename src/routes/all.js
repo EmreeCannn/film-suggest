@@ -3,9 +3,7 @@ import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-/**
- * YouTube embed → watch
- */
+/** YouTube embed → watch */
 function convertToWatchUrl(youtubeIdOrUrl) {
   if (!youtubeIdOrUrl) return null;
 
@@ -25,17 +23,14 @@ function convertToWatchUrl(youtubeIdOrUrl) {
   return null;
 }
 
-
-/**
- * Full movie builder — JSON formatı korunmuş halde
- */
+/** FULL movie builder (JSON formatı BOZULMADAN) */
 async function buildMovieObject(movieId) {
   try {
-    // 1) DETAILS
+    // DETAILS
     const detailsRes = await tmdb.get(`/movie/${movieId}`);
     const details = detailsRes.data;
 
-    // 2) CAST
+    // CAST
     const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
     const castRaw = creditsRes.data.cast.slice(0, 8);
     const cast = castRaw.map(p => ({
@@ -46,16 +41,16 @@ async function buildMovieObject(movieId) {
         : null
     }));
 
-    // 3) TRAILER (MP4 → YouTube fallback)
+    // TRAILER → MP4 > YouTube fallback
     const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
     const videos = videoRes.data.results || [];
+
+    let videoUrl = null;
+    let videoSource = null;
 
     const tmdbVideo = videos.find(
       v => v.site === "TMDB" && v.url?.endsWith(".mp4")
     );
-
-    let videoUrl = null;
-    let videoSource = null;
 
     if (tmdbVideo) {
       videoUrl = tmdbVideo.url;
@@ -70,10 +65,10 @@ async function buildMovieObject(movieId) {
       }
     }
 
-    // ❌ TikTok akışında video YOKSA film kullanılmaz
+    // ❌ Video yoksa TikTok feed'e alınmaz
     if (!videoUrl) return null;
 
-    // 4) WATCH PROVIDERS
+    // WATCH PROVIDERS
     const providerRes = await tmdb.get(`/movie/${movieId}/watch/providers`);
     const us = providerRes.data.results?.US || {};
 
@@ -97,7 +92,7 @@ async function buildMovieObject(movieId) {
 
     const platformLink = us.link || null;
 
-    // 5) RETURN — JSON formatı aynen korunuyor
+    // RETURN (JSON formatı aynen korunuyor)
     return {
       id: details.id,
       title: details.title,
@@ -126,26 +121,31 @@ async function buildMovieObject(movieId) {
 }
 
 
-
 /**
- * GET /api/all — TikTok-ready global feed
+ * GET /api/all?page=X
+ * TikTok Infinite Scroll version
  */
 router.get("/", async (req, res) => {
   try {
+    const page = Number(req.query.page) || 1;
+
+    // Her page = 5 TMDB sayfası (5 × 20 = ~100 film)
+    const start = (page - 1) * 5 + 1;
+    const end = start + 4;
+
     let movies = [];
 
-    // 1–10 page → 200 film
-    for (let page = 1; page <= 10; page++) {
+    for (let p = start; p <= end; p++) {
       const discover = await tmdb.get("/discover/movie", {
         params: {
           sort_by: "popularity.desc",
-          page
+          page: p
         }
       });
       movies.push(...discover.data.results);
     }
 
-    // Filtre: Çöp film alma
+    // Çöp filmleri ele
     movies = movies.filter(m =>
       m.poster_path &&
       m.backdrop_path &&
@@ -154,16 +154,17 @@ router.get("/", async (req, res) => {
       m.vote_average > 0
     );
 
-    // TikTok akışı: Sadece videosu olan filmler
+    // Video garantili filmler
     const finalMovies = [];
 
     for (const m of movies) {
       const full = await buildMovieObject(m.id);
       if (full) finalMovies.push(full);
-      if (finalMovies.length >= 200) break;
+      if (finalMovies.length >= 100) break;
     }
 
     return res.json({
+      page,
       count: finalMovies.length,
       movies: finalMovies
     });
