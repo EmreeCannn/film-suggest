@@ -3,111 +3,69 @@ import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-/** YouTube embed → watch */
-function convertToWatchUrl(youtubeIdOrUrl) {
+/**
+ * YouTube embed URL üretici — sadece playsinline=1
+ */
+function convertToEmbedUrl(youtubeIdOrUrl) {
   if (!youtubeIdOrUrl) return null;
 
+  // Eğer sadece ID geldiyse:
   if (!youtubeIdOrUrl.includes("youtube")) {
-    return `https://www.youtube.com/watch?v=${youtubeIdOrUrl}`;
+    return `https://www.youtube.com/embed/${youtubeIdOrUrl}?playsinline=1`;
   }
 
-  const match = youtubeIdOrUrl.match(/embed\/([^?]+)/);
-  if (match && match[1]) {
-    return `https://www.youtube.com/watch?v=${match[1]}`;
+  // Embed URL geldiyse:
+  const embedMatch = youtubeIdOrUrl.match(/embed\/([^?]+)/);
+  if (embedMatch && embedMatch[1]) {
+    return `https://www.youtube.com/embed/${embedMatch[1]}?playsinline=1`;
   }
 
-  if (youtubeIdOrUrl.includes("watch?v=")) {
-    return youtubeIdOrUrl;
+  // Watch URL geldiyse:
+  const watchMatch = youtubeIdOrUrl.match(/watch\?v=([^&]+)/);
+  if (watchMatch && watchMatch[1]) {
+    return `https://www.youtube.com/embed/${watchMatch[1]}?playsinline=1`;
   }
 
   return null;
 }
 
-/** FULL movie builder (JSON formatı BOZULMADAN) */
+/**
+ * Tek film objesi hazırlama (poster/backdrop + trailer)
+ */
 async function buildMovieObject(movieId) {
   try {
-    const detailsRes = await tmdb.get(`/movie/${movieId}`);
-    const details = detailsRes.data;
+    // TMDB detay
+    const details = await tmdb.get(`/movie/${movieId}`);
 
-    const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
-    const castRaw = creditsRes.data.cast.slice(0, 8);
-    const cast = castRaw.map(p => ({
-      name: p.name,
-      character: p.character,
-      profile: p.profile_path
-        ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
-        : null
-    }));
+    // Video
+    const videos = await tmdb.get(`/movie/${movieId}/videos`);
 
-    const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
-    const videos = videoRes.data.results || [];
-
-    let videoUrl = null;
-    let videoSource = null;
-
-    const tmdbVideo = videos.find(
-      v => v.site === "TMDB" && v.url?.endsWith(".mp4")
+    const yt = videos.data.results.find(
+      (v) => v.site === "YouTube" && v.type === "Trailer"
     );
 
-    if (tmdbVideo) {
-      videoUrl = tmdbVideo.url;
-      videoSource = "tmdb_mp4";
-    } else {
-      const yt = videos.find(
-        v => v.site === "YouTube" && v.type === "Trailer"
-      );
-      if (yt) {
-        videoUrl = convertToWatchUrl(yt.key);
-        videoSource = "youtube";
-      }
-    }
+    const videoUrl = yt ? convertToEmbedUrl(yt.key) : null;
 
+    // Eğer video yoksa TikTok feed'e ekleme
     if (!videoUrl) return null;
 
-    const providerRes = await tmdb.get(`/movie/${movieId}/watch/providers`);
-    const us = providerRes.data.results?.US || {};
-
-    function mapProviders(list, type) {
-      if (!list) return [];
-      return list.map(p => ({
-        name: p.provider_name,
-        type,
-        logo: p.logo_path
-          ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
-          : null
-      }));
-    }
-
-    const platforms = [
-      ...mapProviders(us.flatrate, "subscription"),
-      ...mapProviders(us.buy, "buy"),
-      ...mapProviders(us.rent, "rent"),
-      ...mapProviders(us.ads, "ads")
-    ];
-
-    const platformLink = us.link || null;
-
     return {
-      id: details.id,
-      title: details.title,
-      overview: details.overview,
-      year: details.release_date?.split("-")[0] || "N/A",
-      rating: details.vote_average,
-      runtime: details.runtime,
-      genres: details.genres?.map(g => g.name) || [],
-      poster: details.poster_path
-        ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
-        : null,
-      backdrop: details.backdrop_path
-        ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}`
-        : null,
-      cast,
-      platforms,
-      platformLink,
-      videoUrl,
-      videoSource
-    };
+      id: details.data.id,
+      title: details.data.title,
+      overview: details.data.overview,
+      year: details.data.release_date?.split("-")[0] || null,
 
+      poster: details.data.poster_path
+        ? `https://image.tmdb.org/t/p/w500${details.data.poster_path}`
+        : null,
+
+      backdrop: details.data.backdrop_path
+        ? `https://image.tmdb.org/t/p/w780${details.data.backdrop_path}`
+        : null,
+
+      videoUrl,
+      videoSource: "youtube"
+    };
   } catch (err) {
     console.error("buildMovieObject error:", err.message);
     return null;
@@ -115,38 +73,41 @@ async function buildMovieObject(movieId) {
 }
 
 /**
- * GET /api/all
- * RANDOM mega feed
+ * GET /api/all?page=X
+ * TikTok Infinite Scroll
  */
 router.get("/", async (req, res) => {
   try {
     const page = Number(req.query.page) || 1;
 
-    // RANDOM PAGE SELECTOR → her page’de 10 farklı random sayfa
-    const randomPages = Array.from({ length: 10 }, () =>
-      Math.floor(Math.random() * 400) + 1
-    );
+    // Her page = 5 TMDB sayfası (5 × 20 = ~100 film)
+    const start = (page - 1) * 5 + 1;
+    const end = start + 4;
 
     let movies = [];
 
-    for (let p of randomPages) {
+    for (let p = start; p <= end; p++) {
       const discover = await tmdb.get("/discover/movie", {
         params: {
           sort_by: "popularity.desc",
           page: p
         }
       });
+
       movies.push(...discover.data.results);
     }
 
-    movies = movies.filter(m =>
-      m.poster_path &&
-      m.backdrop_path &&
-      m.overview &&
-      m.overview.length > 20 &&
-      m.vote_average > 0
+    // Temizlik
+    movies = movies.filter(
+      (m) =>
+        m.poster_path &&
+        m.backdrop_path &&
+        m.overview &&
+        m.overview.length > 20 &&
+        m.vote_average > 0
     );
 
+    // Trailer garantili doldur
     const finalMovies = [];
 
     for (const m of movies) {
@@ -160,7 +121,6 @@ router.get("/", async (req, res) => {
       count: finalMovies.length,
       movies: finalMovies
     });
-
   } catch (err) {
     console.error("ALL FEED ERROR:", err.message);
     return res.status(500).json({ error: "all hata verdi knk" });
