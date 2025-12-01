@@ -9,15 +9,27 @@ const trendingCache = new NodeCache({
   checkperiod: 320,
 });
 
-// YouTube embed → watch
+/**
+ * YouTube embed → watch dönüştürücü
+ */
 function convertToWatchUrl(youtubeIdOrUrl) {
   if (!youtubeIdOrUrl) return null;
-  if (!youtubeIdOrUrl.includes("youtube"))
+
+  if (!youtubeIdOrUrl.includes("youtube")) {
     return `https://www.youtube.com/watch?v=${youtubeIdOrUrl}`;
+  }
+
   const match = youtubeIdOrUrl.match(/embed\/([^?]+)/);
-  if (match && match[1])
+  if (match && match[1]) {
     return `https://www.youtube.com/watch?v=${match[1]}`;
-  return youtubeIdOrUrl.includes("watch?v=") ? youtubeIdOrUrl : null;
+  }
+
+  const watchMatch = youtubeIdOrUrl.match(/watch\?v=([^&]+)/);
+  if (watchMatch && watchMatch[1]) {
+    return `https://www.youtube.com/watch?v=${watchMatch[1]}`;
+  }
+
+  return null;
 }
 
 router.get("/", async (req, res) => {
@@ -29,11 +41,11 @@ router.get("/", async (req, res) => {
       return res.json({ ...cached, cached: true });
     }
 
-    // 1) Trending filmleri al (30 tane)
+    // 1) Trending 30 film getir
     const trendingRes = await tmdb.get("/trending/movie/day");
     const movies = trendingRes.data.results.slice(0, 30);
 
-    // 2) Her film için 5 API isteğini paralel yap
+    // 2) Paralel full detay çekme
     const feed = await Promise.all(
       movies.map(async (movie) => {
         const movieId = movie.id;
@@ -42,8 +54,8 @@ router.get("/", async (req, res) => {
           detailsRes,
           creditsRes,
           releaseRes,
-          videoRes,
-          providerRes,
+          videosRes,
+          providersRes,
         ] = await Promise.all([
           tmdb.get(`/movie/${movieId}`),
           tmdb.get(`/movie/${movieId}/credits`),
@@ -52,9 +64,9 @@ router.get("/", async (req, res) => {
           tmdb.get(`/movie/${movieId}/watch/providers`),
         ]);
 
-        const details = detailsRes.data;
+        const d = detailsRes.data;
 
-        // Cast
+        // 🎭 CAST
         const cast = creditsRes.data.cast.slice(0, 10).map((p) => ({
           name: p.name,
           character: p.character,
@@ -63,27 +75,27 @@ router.get("/", async (req, res) => {
             : null,
         }));
 
-        // Director
+        // 🎬 DIRECTOR
         const director =
           creditsRes.data.crew.find((p) => p.job === "Director")?.name || null;
 
-        // Certification
+        // 🔞 CERTIFICATION
         const certification =
           releaseRes.data.results
             ?.find((r) => r.iso_3166_1 === "US")
             ?.release_dates?.[0]?.certification || null;
 
-        // Videos
-        const videos = videoRes.data.results || [];
-        const tmdbVideo = videos.find(
-          (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
-        );
-
+        // 🎞 VIDEO
+        const videos = videosRes.data.results || [];
         let videoUrl = null;
         let videoSource = null;
 
-        if (tmdbVideo) {
-          videoUrl = tmdbVideo.url;
+        const tmdbMp4 = videos.find(
+          (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
+        );
+
+        if (tmdbMp4) {
+          videoUrl = tmdbMp4.url;
           videoSource = "tmdb_mp4";
         } else {
           const yt = videos.find(
@@ -95,8 +107,11 @@ router.get("/", async (req, res) => {
           }
         }
 
-        // Providers
-        const us = providerRes.data.results?.US || {};
+        // Trailer yoksa film ekleme
+        if (!videoUrl) return null;
+
+        // 📡 PROVIDERS
+        const us = providersRes.data.results?.US || {};
 
         const mapProviders = (list, type) =>
           !list
@@ -118,20 +133,20 @@ router.get("/", async (req, res) => {
 
         return {
           id: movieId,
-          title: details.title,
-          overview: details.overview,
-          year: details.release_date?.split("-")[0] || "N/A",
-          rating: details.vote_average,
-          runtime: details.runtime,
+          title: d.title,
+          overview: d.overview,
+          year: d.release_date?.split("-")[0] || "N/A",
+          rating: d.vote_average,
+          runtime: d.runtime,
           certification,
           director,
-          genres: details.genres?.map((g) => g.name) || [],
+          genres: d.genres?.map((g) => g.name) || [],
           cast,
-          poster: details.poster_path
-            ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
+          poster: d.poster_path
+            ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
             : null,
-          backdrop: details.backdrop_path
-            ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}`
+          backdrop: d.backdrop_path
+            ? `https://image.tmdb.org/t/p/w780${d.backdrop_path}`
             : null,
           platforms,
           platformLink: us.link || null,
@@ -141,10 +156,13 @@ router.get("/", async (req, res) => {
       })
     );
 
+    // null dönenleri temizle (video olmayanlar)
+    const finalFeed = feed.filter((f) => f !== null);
+
     const payload = {
       mode: "trending",
-      count: feed.length,
-      feed,
+      count: finalFeed.length,
+      feed: finalFeed,
     };
 
     trendingCache.set(cacheKey, payload);
@@ -152,7 +170,7 @@ router.get("/", async (req, res) => {
     return res.json({ ...payload, cached: false });
   } catch (err) {
     console.error("TRENDING ERROR:", err.message);
-    res.status(500).json({ error: "Trending hata verdi knk" });
+    return res.status(500).json({ error: "Trending hata verdi knk" });
   }
 });
 

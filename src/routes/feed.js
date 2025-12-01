@@ -5,20 +5,31 @@ import { tmdb } from "../services/tmdb.js";
 const router = express.Router();
 
 const feedCache = new NodeCache({
-  stdTTL: 300, // 5 dakika cache
+  stdTTL: 300,
   checkperiod: 320,
 });
 
+// Embed → Watch dönüştüren fonksiyon
 function convertToWatchUrl(youtubeIdOrUrl) {
   if (!youtubeIdOrUrl) return null;
 
-  if (!youtubeIdOrUrl.includes("youtube"))
+  // Eğer sadece ID ise
+  if (!youtubeIdOrUrl.includes("youtube")) {
     return `https://www.youtube.com/watch?v=${youtubeIdOrUrl}`;
+  }
 
+  // Eğer embed URL ise
   const match = youtubeIdOrUrl.match(/embed\/([^?]+)/);
-  if (match) return `https://www.youtube.com/watch?v=${match[1]}`;
+  if (match) {
+    return `https://www.youtube.com/watch?v=${match[1]}`;
+  }
 
-  return youtubeIdOrUrl.includes("watch?v=") ? youtubeIdOrUrl : null;
+  // Zaten watch ise
+  if (youtubeIdOrUrl.includes("watch?v=")) {
+    return youtubeIdOrUrl;
+  }
+
+  return null;
 }
 
 const GENRE_MAP = {
@@ -40,13 +51,13 @@ router.get("/", async (req, res) => {
     const genreId = GENRE_MAP[category] || 28;
 
     const cacheKey = `feed_${category}`;
-    const cachedData = feedCache.get(cacheKey);
 
-    if (cachedData) {
-      return res.json({ ...cachedData, cached: true });
+    const cached = feedCache.get(cacheKey);
+    if (cached) {
+      return res.json({ ...cached, cached: true });
     }
 
-    // 1️⃣ En popüler 30 filmi al
+    // İlk 30 popüler film
     const discover = await tmdb.get("/discover/movie", {
       params: {
         with_genres: genreId,
@@ -57,42 +68,43 @@ router.get("/", async (req, res) => {
 
     const movies = discover.data.results.slice(0, 30);
 
-    // 2️⃣ Tüm heavy data TEK API çağrısı ile alınır (append_to_response)
+    // En ağır datayı tek seferde getir
     const feed = await Promise.all(
       movies.map(async (movie) => {
         const movieId = movie.id;
 
-        const fullRes = await tmdb.get(`/movie/${movieId}`, {
+        const full = await tmdb.get(`/movie/${movieId}`, {
           params: {
             append_to_response:
               "credits,videos,release_dates,watch/providers",
           },
         });
 
-        const data = fullRes.data;
+        const d = full.data;
 
-        // Cast
-        const cast = (data.credits?.cast || []).slice(0, 10).map((p) => ({
-          name: p.name,
-          character: p.character,
-          profile: p.profile_path
-            ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
-            : null,
-        }));
+        // 1️⃣ Cast
+        const cast = (d.credits?.cast || [])
+          .slice(0, 10)
+          .map((p) => ({
+            name: p.name,
+            character: p.character,
+            profile: p.profile_path
+              ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
+              : null,
+          }));
 
-        // Director
+        // 2️⃣ Yönetmen
         const director =
-          (data.credits?.crew || []).find((p) => p.job === "Director")
-            ?.name || null;
+          d.credits?.crew?.find((c) => c.job === "Director")?.name || null;
 
-        // Certification
+        // 3️⃣ Certification (PG-13 vs)
         const certification =
-          data.release_dates?.results
+          d.release_dates?.results
             ?.find((r) => r.iso_3166_1 === "US")
             ?.release_dates?.[0]?.certification || null;
 
-        // Videos
-        const videos = data.videos?.results || [];
+        // 4️⃣ Video seçimi
+        const videos = d.videos?.results || [];
 
         let videoUrl = null;
         let videoSource = null;
@@ -114,8 +126,11 @@ router.get("/", async (req, res) => {
           }
         }
 
-        // Providers
-        const us = data["watch/providers"]?.results?.US || {};
+        // Eğer video yoksa bu filmi feed'e alma
+        if (!videoUrl) return null;
+
+        // 5️⃣ Yayıncı platformlar
+        const providers = d["watch/providers"]?.results?.US || {};
 
         const mapProviders = (list, type) =>
           !list
@@ -129,35 +144,47 @@ router.get("/", async (req, res) => {
               }));
 
         const platforms = [
-          ...mapProviders(us.flatrate, "subscription"),
-          ...mapProviders(us.buy, "buy"),
-          ...mapProviders(us.rent, "rent"),
-          ...mapProviders(us.ads, "ads"),
+          ...mapProviders(providers.flatrate, "subscription"),
+          ...mapProviders(providers.buy, "buy"),
+          ...mapProviders(providers.rent, "rent"),
+          ...mapProviders(providers.ads, "ads"),
         ];
 
+        // 6️⃣ Production Companies
+        const productionCompanies = (d.production_companies || []).map(
+          (p) => ({
+            name: p.name,
+            logo: p.logo_path
+              ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
+              : null,
+          })
+        );
+
+        // 🔥 ESKİ FORMATIN %100 KOPYASI
         return {
-          id: data.id,
-          title: data.title,
-          overview: data.overview,
-          year: data.release_date?.split("-")[0] || "N/A",
-          rating: data.vote_average,
-          runtime: data.runtime,
+          id: d.id,
+          title: d.title,
+          overview: d.overview,
+          year: d.release_date?.split("-")[0] || "N/A",
+          rating: d.vote_average,
+          runtime: d.runtime,
 
           certification,
           director,
-          genres: data.genres?.map((g) => g.name) || [],
+          genres: d.genres?.map((g) => g.name) || [],
+          productionCompanies,
 
           cast,
 
-          poster: data.poster_path
-            ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
+          poster: d.poster_path
+            ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
             : null,
-          backdrop: data.backdrop_path
-            ? `https://image.tmdb.org/t/p/w780${data.backdrop_path}`
+          backdrop: d.backdrop_path
+            ? `https://image.tmdb.org/t/p/w780${d.backdrop_path}`
             : null,
 
           platforms,
-          platformLink: us.link || null,
+          platformLink: providers.link || null,
 
           videoUrl,
           videoSource,
@@ -165,10 +192,12 @@ router.get("/", async (req, res) => {
       })
     );
 
+    const finalFeed = feed.filter(Boolean); // video olmayanları çıkar
+
     const result = {
       category,
-      count: feed.length,
-      feed,
+      count: finalFeed.length,
+      feed: finalFeed,
     };
 
     feedCache.set(cacheKey, result);

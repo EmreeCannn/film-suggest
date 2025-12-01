@@ -3,123 +3,172 @@ import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-/**
- * YouTube embed URL üretici — sadece playsinline=1
- */
-function convertToEmbedUrl(youtubeIdOrUrl) {
-  if (!youtubeIdOrUrl) return null;
+/* ---------------------------------------------
+   YOUTUBE → WATCH FORMAT
+--------------------------------------------- */
+function convertToWatchUrl(idOrUrl) {
+  if (!idOrUrl) return null;
 
-  // Eğer sadece ID geldiyse:
-  if (!youtubeIdOrUrl.includes("youtube")) {
-    return `https://www.youtube.com/embed/${youtubeIdOrUrl}?playsinline=1`;
-  }
+  if (!idOrUrl.includes("youtube"))
+    return `https://www.youtube.com/watch?v=${idOrUrl}`;
 
-  // Embed URL geldiyse:
-  const embedMatch = youtubeIdOrUrl.match(/embed\/([^?]+)/);
-  if (embedMatch && embedMatch[1]) {
-    return `https://www.youtube.com/embed/${embedMatch[1]}?playsinline=1`;
-  }
+  const idFromEmbed = idOrUrl.match(/embed\/([^?]+)/);
+  if (idFromEmbed) return `https://www.youtube.com/watch?v=${idFromEmbed[1]}`;
 
-  // Watch URL geldiyse:
-  const watchMatch = youtubeIdOrUrl.match(/watch\?v=([^&]+)/);
-  if (watchMatch && watchMatch[1]) {
-    return `https://www.youtube.com/embed/${watchMatch[1]}?playsinline=1`;
-  }
+  const idFromWatch = idOrUrl.match(/watch\\?v=([^&]+)/);
+  if (idFromWatch) return `https://www.youtube.com/watch?v=${idFromWatch[1]}`;
 
   return null;
 }
 
-/**
- * Tek film objesi hazırlama (poster/backdrop + trailer)
- */
-async function buildMovieObject(movieId) {
-  try {
-    // TMDB detay
-    const details = await tmdb.get(`/movie/${movieId}`);
+/* ---------------------------------------------
+    TEK FİLM OBJECT (FORMAT BOZULMADAN)
+--------------------------------------------- */
+function buildMovieObject(data, videos, providers) {
+  const cast = (data.credits?.cast || [])
+    .slice(0, 10)
+    .map((p) => ({
+      name: p.name,
+      character: p.character,
+      profile: p.profile_path
+        ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
+        : null,
+    }));
 
-    // Video
-    const videos = await tmdb.get(`/movie/${movieId}/videos`);
+  const director =
+    (data.credits?.crew || []).find((p) => p.job === "Director")?.name || null;
 
-    const yt = videos.data.results.find(
+  const certification =
+    data.release_dates?.results
+      ?.find((r) => r.iso_3166_1 === "US")
+      ?.release_dates?.[0]?.certification || null;
+
+  let videoUrl = null;
+  let videoSource = null;
+
+  const tmdbMp4 = videos.find(
+    (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
+  );
+
+  if (tmdbMp4) {
+    videoUrl = tmdbMp4.url;
+    videoSource = "tmdb_mp4";
+  } else {
+    const yt = videos.find(
       (v) => v.site === "YouTube" && v.type === "Trailer"
     );
-
-    const videoUrl = yt ? convertToEmbedUrl(yt.key) : null;
-
-    // Eğer video yoksa TikTok feed'e ekleme
-    if (!videoUrl) return null;
-
-    return {
-      id: details.data.id,
-      title: details.data.title,
-      overview: details.data.overview,
-      year: details.data.release_date?.split("-")[0] || null,
-
-      poster: details.data.poster_path
-        ? `https://image.tmdb.org/t/p/w500${details.data.poster_path}`
-        : null,
-
-      backdrop: details.data.backdrop_path
-        ? `https://image.tmdb.org/t/p/w780${details.data.backdrop_path}`
-        : null,
-
-      videoUrl,
-      videoSource: "youtube"
-    };
-  } catch (err) {
-    console.error("buildMovieObject error:", err.message);
-    return null;
+    if (yt) {
+      videoUrl = convertToWatchUrl(yt.key);
+      videoSource = "youtube";
+    }
   }
+
+  if (!videoUrl) return null;
+
+  const us = providers?.results?.US || {};
+
+  const mapProviders = (list, type) =>
+    !list
+      ? []
+      : list.map((p) => ({
+          name: p.provider_name,
+          type,
+          logo: p.logo_path
+            ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
+            : null,
+        }));
+
+  const platforms = [
+    ...mapProviders(us.flatrate, "subscription"),
+    ...mapProviders(us.buy, "buy"),
+    ...mapProviders(us.rent, "rent"),
+    ...mapProviders(us.ads, "ads"),
+  ];
+
+  return {
+    id: data.id,
+    title: data.title,
+    overview: data.overview,
+    year: data.release_date?.split("-")[0] || "N/A",
+    rating: data.vote_average,
+    runtime: data.runtime,
+    certification,
+    director,
+    genres: data.genres?.map((g) => g.name) || [],
+    cast,
+    poster: data.poster_path
+      ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
+      : null,
+    backdrop: data.backdrop_path
+      ? `https://image.tmdb.org/t/p/w780${data.backdrop_path}`
+      : null,
+    platforms,
+    platformLink: us.link || null,
+    videoUrl,
+    videoSource,
+  };
 }
 
-/**
- * GET /api/all?page=X
- * TikTok Infinite Scroll
- */
+/* ---------------------------------------------
+    SUPER BOOSTED PAGING
+    page=1 → 2 discover pages (40 film)
+    page>1 → 8 discover pages (160 film)
+--------------------------------------------- */
+function getDiscoverPageCount(page) {
+  if (page === 1) return 2;   // hızlı açılış için az
+  return 8;                  // sonsuz scroll için çok
+}
+
+/* ---------------------------------------------
+    /api/all?page=X
+--------------------------------------------- */
 router.get("/", async (req, res) => {
   try {
     const page = Number(req.query.page) || 1;
 
-    // Her page = 5 TMDB sayfası (5 × 20 = ~100 film)
-    const start = (page - 1) * 5 + 1;
-    const end = start + 4;
+    const discoverCount = getDiscoverPageCount(page);
 
     let movies = [];
 
-    for (let p = start; p <= end; p++) {
+    for (let i = 1; i <= discoverCount; i++) {
       const discover = await tmdb.get("/discover/movie", {
-        params: {
-          sort_by: "popularity.desc",
-          page: p
-        }
+        params: { sort_by: "popularity.desc", page: i },
       });
 
       movies.push(...discover.data.results);
     }
 
-    // Temizlik
     movies = movies.filter(
       (m) =>
         m.poster_path &&
         m.backdrop_path &&
-        m.overview &&
-        m.overview.length > 20 &&
+        m.overview?.length > 20 &&
         m.vote_average > 0
     );
 
-    // Trailer garantili doldur
-    const finalMovies = [];
+    const results = [];
 
     for (const m of movies) {
-      const full = await buildMovieObject(m.id);
-      if (full) finalMovies.push(full);
-      if (finalMovies.length >= 100) break;
+      const full = await tmdb.get(`/movie/${m.id}`, {
+        params: {
+          append_to_response:
+            "credits,videos,release_dates,watch/providers",
+        },
+      });
+
+      const obj = buildMovieObject(
+        full.data,
+        full.data.videos?.results || [],
+        full.data["watch/providers"]
+      );
+
+      if (obj) results.push(obj);
     }
 
     return res.json({
       page,
-      count: finalMovies.length,
-      movies: finalMovies
+      count: results.length,
+      movies: results,
     });
   } catch (err) {
     console.error("ALL FEED ERROR:", err.message);
