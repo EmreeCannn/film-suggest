@@ -26,11 +26,9 @@ function convertToWatchUrl(youtubeIdOrUrl) {
 /** FULL movie builder (JSON formatı BOZULMADAN) */
 async function buildMovieObject(movieId) {
   try {
-    // DETAILS
     const detailsRes = await tmdb.get(`/movie/${movieId}`);
     const details = detailsRes.data;
 
-    // CAST
     const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
     const castRaw = creditsRes.data.cast.slice(0, 8);
     const cast = castRaw.map(p => ({
@@ -41,7 +39,6 @@ async function buildMovieObject(movieId) {
         : null
     }));
 
-    // TRAILER → MP4 > YouTube fallback
     const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
     const videos = videoRes.data.results || [];
 
@@ -65,10 +62,8 @@ async function buildMovieObject(movieId) {
       }
     }
 
-    // ❌ Video yoksa TikTok feed'e alınmaz
     if (!videoUrl) return null;
 
-    // WATCH PROVIDERS
     const providerRes = await tmdb.get(`/movie/${movieId}/watch/providers`);
     const us = providerRes.data.results?.US || {};
 
@@ -92,7 +87,6 @@ async function buildMovieObject(movieId) {
 
     const platformLink = us.link || null;
 
-    // RETURN (JSON formatı aynen korunuyor)
     return {
       id: details.id,
       title: details.title,
@@ -120,22 +114,22 @@ async function buildMovieObject(movieId) {
   }
 }
 
-
 /**
- * GET /api/all?page=X
- * TikTok Infinite Scroll version
+ * GET /api/all
+ * RANDOM mega feed
  */
 router.get("/", async (req, res) => {
   try {
     const page = Number(req.query.page) || 1;
 
-    // Her page = 5 TMDB sayfası (5 × 20 = ~100 film)
-    const start = (page - 1) * 5 + 1;
-    const end = start + 4;
+    // RANDOM PAGE SELECTOR → her page’de 10 farklı random sayfa
+    const randomPages = Array.from({ length: 10 }, () =>
+      Math.floor(Math.random() * 400) + 1
+    );
 
     let movies = [];
 
-    for (let p = start; p <= end; p++) {
+    for (let p of randomPages) {
       const discover = await tmdb.get("/discover/movie", {
         params: {
           sort_by: "popularity.desc",
@@ -145,7 +139,6 @@ router.get("/", async (req, res) => {
       movies.push(...discover.data.results);
     }
 
-    // Çöp filmleri ele
     movies = movies.filter(m =>
       m.poster_path &&
       m.backdrop_path &&
@@ -154,7 +147,6 @@ router.get("/", async (req, res) => {
       m.vote_average > 0
     );
 
-    // Video garantili filmler
     const finalMovies = [];
 
     for (const m of movies) {
