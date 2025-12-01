@@ -5,6 +5,7 @@ import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
+const sessions = {};
 /* ============================================================
    OPENROUTER CHAT HELPER
 ============================================================ */
@@ -130,7 +131,7 @@ router.post("/session/start", (req, res) => {
   return res.json({
     sessionId,
     aiMessage:
-      "Chat session started knk. Ask me anything about this movie in English."
+      "Chat session started . Ask me anything about this movie."
   });
 });
 

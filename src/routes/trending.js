@@ -4,76 +4,58 @@ import { tmdb } from "../services/tmdb.js";
 
 const router = express.Router();
 
-// Cache (5 dakika)
 const trendingCache = new NodeCache({
-  stdTTL: 300,
+  stdTTL: 300, // 5 dakika
   checkperiod: 320,
 });
 
-// In-flight (aynı anda 100 istek → tek sorgu)
-const inFlightTrending = new Map();
-
-/**
- * YouTube Embed → Watch URL
- */
+// YouTube embed → watch
 function convertToWatchUrl(youtubeIdOrUrl) {
   if (!youtubeIdOrUrl) return null;
-
-  if (!youtubeIdOrUrl.includes("youtube")) {
+  if (!youtubeIdOrUrl.includes("youtube"))
     return `https://www.youtube.com/watch?v=${youtubeIdOrUrl}`;
-  }
-
   const match = youtubeIdOrUrl.match(/embed\/([^?]+)/);
-  if (match && match[1]) {
+  if (match && match[1])
     return `https://www.youtube.com/watch?v=${match[1]}`;
-  }
-
-  if (youtubeIdOrUrl.includes("watch?v=")) {
-    return youtubeIdOrUrl;
-  }
-
-  return null;
+  return youtubeIdOrUrl.includes("watch?v=") ? youtubeIdOrUrl : null;
 }
 
 router.get("/", async (req, res) => {
   try {
     const cacheKey = "trending_movies";
-
-    // 1) Cache kontrol
     const cached = trendingCache.get(cacheKey);
+
     if (cached) {
       return res.json({ ...cached, cached: true });
     }
 
-    // 2) In-flight (aynı anda 20 istek → tek sorgu)
-    if (inFlightTrending.has(cacheKey)) {
-      const shared = await inFlightTrending.get(cacheKey);
-      return res.json({ ...shared, shared: true, cached: true });
-    }
+    // 1) Trending filmleri al (30 tane)
+    const trendingRes = await tmdb.get("/trending/movie/day");
+    const movies = trendingRes.data.results.slice(0, 30);
 
-    // 3) İlk gerçek fetch işlemi
-    const fetchPromise = (async () => {
-      // TMDB trending
-      const trendingRes = await tmdb.get("/trending/movie/day");
-
-      // İlk 30 trend film
-      const movies = trendingRes.data.results.slice(0, 30);
-
-      const feed = [];
-
-      for (const movie of movies) {
+    // 2) Her film için 5 API isteğini paralel yap
+    const feed = await Promise.all(
+      movies.map(async (movie) => {
         const movieId = movie.id;
 
-        // 1) Details
-        const detailsRes = await tmdb.get(`/movie/${movieId}`);
+        const [
+          detailsRes,
+          creditsRes,
+          releaseRes,
+          videoRes,
+          providerRes,
+        ] = await Promise.all([
+          tmdb.get(`/movie/${movieId}`),
+          tmdb.get(`/movie/${movieId}/credits`),
+          tmdb.get(`/movie/${movieId}/release_dates`),
+          tmdb.get(`/movie/${movieId}/videos`),
+          tmdb.get(`/movie/${movieId}/watch/providers`),
+        ]);
+
         const details = detailsRes.data;
 
-        // 2) Cast + Director
-        const creditsRes = await tmdb.get(`/movie/${movieId}/credits`);
-        const castRaw = creditsRes.data.cast.slice(0, 10);
-        const crewRaw = creditsRes.data.crew;
-
-        const cast = castRaw.map((p) => ({
+        // Cast
+        const cast = creditsRes.data.cast.slice(0, 10).map((p) => ({
           name: p.name,
           character: p.character,
           profile: p.profile_path
@@ -81,22 +63,20 @@ router.get("/", async (req, res) => {
             : null,
         }));
 
+        // Director
         const director =
-          crewRaw.find((p) => p.job === "Director")?.name || null;
+          creditsRes.data.crew.find((p) => p.job === "Director")?.name || null;
 
-        // 3) Certification
-        const releaseRes = await tmdb.get(`/movie/${movieId}/release_dates`);
+        // Certification
         const certification =
           releaseRes.data.results
             ?.find((r) => r.iso_3166_1 === "US")
             ?.release_dates?.[0]?.certification || null;
 
-        // 4) Trailer (TMDB MP4 + YouTube fallback)
-        const videoRes = await tmdb.get(`/movie/${movieId}/videos`);
+        // Videos
         const videos = videoRes.data.results || [];
-
         const tmdbVideo = videos.find(
-          (v) => v.site === "TMDB" && (v.url?.endsWith(".mp4") || false)
+          (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
         );
 
         let videoUrl = null;
@@ -115,35 +95,28 @@ router.get("/", async (req, res) => {
           }
         }
 
-        // 5) Watch Providers (subscription, rent, buy, ads)
-        const providerRes = await tmdb.get(
-          `/movie/${movieId}/watch/providers`
-        );
+        // Providers
+        const us = providerRes.data.results?.US || {};
 
-        const usProviders = providerRes.data.results?.US || {};
-
-        function mapProviders(list, type) {
-          if (!list) return [];
-          return list.map((p) => ({
-            name: p.provider_name,
-            type,
-            logo: p.logo_path
-              ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
-              : null,
-          }));
-        }
+        const mapProviders = (list, type) =>
+          !list
+            ? []
+            : list.map((p) => ({
+                name: p.provider_name,
+                type,
+                logo: p.logo_path
+                  ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
+                  : null,
+              }));
 
         const platforms = [
-          ...mapProviders(usProviders.flatrate, "subscription"),
-          ...mapProviders(usProviders.buy, "buy"),
-          ...mapProviders(usProviders.rent, "rent"),
-          ...mapProviders(usProviders.ads, "ads"),
+          ...mapProviders(us.flatrate, "subscription"),
+          ...mapProviders(us.buy, "buy"),
+          ...mapProviders(us.rent, "rent"),
+          ...mapProviders(us.ads, "ads"),
         ];
 
-        const platformLink = usProviders.link || null;
-
-        // Final output
-        feed.push({
+        return {
           id: movieId,
           title: details.title,
           overview: details.overview,
@@ -153,40 +126,30 @@ router.get("/", async (req, res) => {
           certification,
           director,
           genres: details.genres?.map((g) => g.name) || [],
+          cast,
           poster: details.poster_path
             ? `https://image.tmdb.org/t/p/w500${details.poster_path}`
             : null,
           backdrop: details.backdrop_path
             ? `https://image.tmdb.org/t/p/w780${details.backdrop_path}`
             : null,
-          cast,
           platforms,
-          platformLink,
+          platformLink: us.link || null,
           videoUrl,
           videoSource,
-        });
-      }
+        };
+      })
+    );
 
-      const responseBody = {
-        mode: "trending",
-        count: feed.length,
-        feed,
-      };
+    const payload = {
+      mode: "trending",
+      count: feed.length,
+      feed,
+    };
 
-      // Cache'e yaz
-      trendingCache.set(cacheKey, responseBody);
+    trendingCache.set(cacheKey, payload);
 
-      // In-flight'ten sil
-      inFlightTrending.delete(cacheKey);
-
-      return responseBody;
-    })();
-
-    inFlightTrending.set(cacheKey, fetchPromise);
-
-    const fresh = await fetchPromise;
-
-    res.json({ ...fresh, cached: false });
+    return res.json({ ...payload, cached: false });
   } catch (err) {
     console.error("TRENDING ERROR:", err.message);
     res.status(500).json({ error: "Trending hata verdi knk" });

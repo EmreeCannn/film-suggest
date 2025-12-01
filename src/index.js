@@ -5,6 +5,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import axios from "axios";
 import { PrismaClient } from "@prisma/client";
+import prisma from "./lib/prisma.js";
 import feedRouter from "./routes/feed.js";
 import allRouter from "./routes/all.js"
 import router from "./routes/ai.js";
@@ -14,7 +15,7 @@ import aiMovieChat from "./routes/aiMovieChat.js";
 dotenv.config();
 
 const app = express();
-const prisma = new PrismaClient();
+// const prisma = new PrismaClient(); // Removed in favor of singleton import
 
 app.use(express.json());
 app.use(helmet());
@@ -52,6 +53,11 @@ app.use("/api/all", allRouter);
 app.use("/api/trending",trendingRoute);
 app.use("/api/search",searchRouter);
 app.use("/api/ai", aiMovieChat);
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
-});
+
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(3000, () => {
+    console.log("Server running on http://localhost:3000");
+  });
+}
+
+export default app;
