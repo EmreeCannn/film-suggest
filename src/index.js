@@ -12,6 +12,7 @@ import router from "./routes/ai.js";
 import trendingRoute from "./routes/trending.js";
 import searchRouter from "./routes/search.js";
 import aiMovieChat from "./routes/aiMovieChat.js";
+import testDummy from "./routes/testDummy.js";
 dotenv.config();
 
 const app = express();
@@ -53,7 +54,7 @@ app.use("/api/all", allRouter);
 app.use("/api/trending",trendingRoute);
 app.use("/api/search",searchRouter);
 app.use("/api/ai", aiMovieChat);
-
+app.use("/api", testDummy);
 if (process.env.NODE_ENV !== 'production') {
   app.listen(3000, () => {
     console.log("Server running on http://localhost:3000");
