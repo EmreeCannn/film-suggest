@@ -110,34 +110,45 @@ function buildMovieObject(data, videos, providers) {
 }
 
 /* ---------------------------------------------
-    SUPER BOOSTED PAGING
-    page=1 → 2 discover pages (40 film)
-    page>1 → 8 discover pages (160 film)
---------------------------------------------- */
-function getDiscoverPageCount(page) {
-  if (page === 1) return 2;   // hızlı açılış için az
-  return 8;                  // sonsuz scroll için çok
-}
-
-/* ---------------------------------------------
-    /api/all?page=X
+    /api/all?page=X  (TIKTOK RANDOM FEED)
 --------------------------------------------- */
 router.get("/", async (req, res) => {
   try {
     const page = Number(req.query.page) || 1;
 
-    const discoverCount = getDiscoverPageCount(page);
+    // RANDOM SEED → TikTok tarzı farklı feed için kritik
+    const seed = Math.floor(Math.random() * 999999);
 
-    let movies = [];
+    // 1 client page = 10 tmdb page (200 film)
+    const startTmdbPage = (page - 1) * 10 + 1;
+    const endTmdbPage = startTmdbPage + 9;
 
-    for (let i = 1; i <= discoverCount; i++) {
-      const discover = await tmdb.get("/discover/movie", {
-        params: { sort_by: "popularity.desc", page: i },
-      });
+    // Discover fetch
+    const discoverPromises = [];
+    for (let i = startTmdbPage; i <= endTmdbPage; i++) {
+      discoverPromises.push(
+        tmdb.get("/discover/movie", {
+          params: {
+            sort_by: "popularity.desc",
+            page: i,
+            include_adult: false,
+            vote_count_gte: 200,
+            "with_watch_monetization_types": "flatrate|rent|buy",
 
-      movies.push(...discover.data.results);
+            // RANDOM FEED SEED TRICK
+            without_keywords: seed,
+
+            primary_release_date_gte: "1990-01-01",
+            with_original_language: "en",
+          },
+        })
+      );
     }
 
+    const discoverResponses = await Promise.all(discoverPromises);
+    let movies = discoverResponses.flatMap((r) => r.data.results);
+
+    // Basic filter
     movies = movies.filter(
       (m) =>
         m.poster_path &&
@@ -146,27 +157,40 @@ router.get("/", async (req, res) => {
         m.vote_average > 0
     );
 
+    // Random shuffle → TikTok feed hissi
+    movies = movies.sort(() => Math.random() - 0.5);
+
+    // Full detail fetch (20'şer paket)
     const results = [];
+    const BATCH_SIZE = 20;
 
-    for (const m of movies) {
-      const full = await tmdb.get(`/movie/${m.id}`, {
-        params: {
-          append_to_response:
-            "credits,videos,release_dates,watch/providers",
-        },
-      });
+    for (let i = 0; i < movies.length; i += BATCH_SIZE) {
+      const batch = movies.slice(i, i + BATCH_SIZE);
 
-      const obj = buildMovieObject(
-        full.data,
-        full.data.videos?.results || [],
-        full.data["watch/providers"]
+      const batchPromises = batch.map((m) =>
+        tmdb
+          .get(`/movie/${m.id}`, {
+            params: {
+              append_to_response: "credits,videos,release_dates,watch/providers",
+            },
+          })
+          .then((full) =>
+            buildMovieObject(
+              full.data,
+              full.data.videos?.results || [],
+              full.data["watch/providers"]
+            )
+          )
+          .catch(() => null)
       );
 
-      if (obj) results.push(obj);
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults.filter((m) => m !== null));
     }
 
     return res.json({
       page,
+      seed,
       count: results.length,
       movies: results,
     });
