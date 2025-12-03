@@ -53,7 +53,7 @@ router.get("/", async (req, res) => {
           m.overview &&
           m.overview.length > 20
       )
-      .slice(0, 20);
+      .slice(0, 10);
 
     // 2) Full detayları paralel çek
     const movies = await Promise.all(
@@ -118,12 +118,12 @@ router.get("/", async (req, res) => {
             !list
               ? []
               : list.map((p) => ({
-                  name: p.provider_name,
-                  type,
-                  logo: p.logo_path
-                    ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
-                    : null,
-                }));
+                name: p.provider_name,
+                type,
+                logo: p.logo_path
+                  ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
+                  : null,
+              }));
 
           const platforms = [
             ...mapProviders(us.flatrate, "subscription"),

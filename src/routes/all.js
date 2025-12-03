@@ -1,13 +1,9 @@
 import express from "express";
 import { tmdb } from "../services/tmdb.js";
+import prisma from "../lib/prisma.js";
+import { optionalAuthMiddleware } from "./auth.js";
 
 const router = express.Router();
-
-/* ---------------------------------------------
-   DAILY FREEMIUM LIMIT (20 FILM / DAY)
---------------------------------------------- */
-const feedLimit = {}; 
-const ONE_DAY = 24 * 60 * 60 * 1000;
 
 /* ---------------------------------------------
    YOUTUBE → WATCH FORMAT
@@ -77,12 +73,12 @@ function buildMovieObject(data, videos, providers) {
     !list
       ? []
       : list.map((p) => ({
-          name: p.provider_name,
-          type,
-          logo: p.logo_path
-            ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
-            : null,
-        }));
+        name: p.provider_name,
+        type,
+        logo: p.logo_path
+          ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
+          : null,
+      }));
 
   const platforms = [
     ...mapProviders(us.flatrate, "subscription"),
@@ -115,122 +111,171 @@ function buildMovieObject(data, videos, providers) {
   };
 }
 
+// Apply middleware to all routes in this router
+router.use(optionalAuthMiddleware);
+
 /* ---------------------------------------------
     /api/all?page=X  (TIKTOK RANDOM FEED)
 --------------------------------------------- */
 router.get("/", async (req, res) => {
   try {
     const userIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
-    const user = req.user || null;
+    const user = req.user; // Populated by optionalAuthMiddleware
     const isPremium = user?.plan === "premium";
+    const LIMIT = 20;
 
-    /* --------------------------------------------------
-       🔥 DAILY RESET
-    -------------------------------------------------- */
-    if (!feedLimit[userIp]) {
-      feedLimit[userIp] = { count: 0, lastReset: Date.now() };
+    // --- 1. LIMIT CHECK ---
+    if (!isPremium) {
+      let currentCount = 0;
+      let lastReset = new Date();
+
+      if (user) {
+        // Logged in Free User
+        currentCount = user.dailyCount;
+        lastReset = user.lastResetDate;
+      } else {
+        // Guest User
+        let guest = await prisma.guestUsage.findUnique({ where: { ip: userIp } });
+        if (!guest) {
+          guest = await prisma.guestUsage.create({ data: { ip: userIp } });
+        }
+        currentCount = guest.dailyCount;
+        lastReset = guest.lastResetDate;
+      }
+
+      // Check date reset
+      const today = new Date();
+      if (
+        today.getDate() !== lastReset.getDate() ||
+        today.getMonth() !== lastReset.getMonth() ||
+        today.getFullYear() !== lastReset.getFullYear()
+      ) {
+        // Reset needed (will be done during increment, but logically count is 0 now)
+        currentCount = 0;
+      }
+
+      if (currentCount >= LIMIT) {
+        return res.status(403).json({
+          error: "Günlük 20 film limitini doldurdun knk.",
+          limit: LIMIT,
+          isPremium: false
+        });
+      }
     }
 
-    const diff = Date.now() - feedLimit[userIp].lastReset;
-    if (diff > ONE_DAY) {
-      feedLimit[userIp].count = 0;
-      feedLimit[userIp].lastReset = Date.now();
-    }
-
-    /* --------------------------------------------------
-       🔥 LIMIT KONTROLÜ (EN BAŞA ÇEKİLDİ)
-    -------------------------------------------------- */
-    if (!isPremium && feedLimit[userIp].count >= 20) {
-      return res.status(403).json({
-        error: "Günlük 20 film limitini doldurdun knk.",
-        limit: 20,
-        resetIn: ONE_DAY - diff,
-      });
-    }
-
-    /* --------------------------------------------------
-       FETCH BAŞLIYOR
-    -------------------------------------------------- */
+    // --- 2. FETCH MOVIES ---
+    // Optimize: Fetch only 1 page (20 items) based on random seed or client page
     const page = Number(req.query.page) || 1;
-    const seed = Math.floor(Math.random() * 999999);
+    // Use a random page offset to keep it fresh if page=1 is requested repeatedly? 
+    // Or trust client to send incrementing pages. 
+    // User wants "Reels" feel, so random is good.
+    // Let's use the client page but add some randomness if it's the first page.
 
-    const startTmdbPage = (page - 1) * 10 + 1;
-    const endTmdbPage = startTmdbPage + 9;
+    // Actually, to avoid duplicates, we should respect the page number.
+    // But to make it "Reels" like, we want popular movies.
 
-    const discoverPromises = [];
-    for (let i = startTmdbPage; i <= endTmdbPage; i++) {
-      discoverPromises.push(
-        tmdb.get("/discover/movie", {
-          params: {
-            sort_by: "popularity.desc",
-            page: i,
-            include_adult: false,
-            vote_count_gte: 200,
-            "with_watch_monetization_types": "flatrate|rent|buy",
-            without_keywords: seed,
-            primary_release_date_gte: "1990-01-01",
-            with_original_language: "en",
-          },
-        })
-      );
-    }
+    const tmdbResponse = await tmdb.get("/discover/movie", {
+      params: {
+        sort_by: "popularity.desc",
+        page: page,
+        include_adult: false,
+        vote_count_gte: 100,
+        "with_watch_monetization_types": "flatrate|rent|buy",
+        with_original_language: "en",
+      },
+    });
 
-    const discoverResponses = await Promise.all(discoverPromises);
-    let movies = discoverResponses.flatMap((r) => r.data.results);
+    let movies = tmdbResponse.data.results || [];
 
+    // Filter basic requirements
     movies = movies.filter(
       (m) =>
         m.poster_path &&
         m.backdrop_path &&
-        m.overview?.length > 20 &&
-        m.vote_average > 0
+        m.overview?.length > 10
     );
 
+    // Shuffle slightly
     movies = movies.sort(() => Math.random() - 0.5);
 
-    const results = [];
-    const BATCH_SIZE = 20;
+    // Limit to 5-10 to prevent timeout during hydration
+    // Hydrating 20 movies takes time. Let's try 10.
+    const moviesToHydrate = movies.slice(0, 10);
 
-    for (let i = 0; i < movies.length; i += BATCH_SIZE) {
-      const batch = movies.slice(i, i + BATCH_SIZE);
-
-      const batchPromises = batch.map((m) =>
-        tmdb
-          .get(`/movie/${m.id}`, {
-            params: {
-              append_to_response: "credits,videos,release_dates,watch/providers",
-            },
-          })
-          .then((full) =>
-            buildMovieObject(
-              full.data,
-              full.data.videos?.results || [],
-              full.data["watch/providers"]
-            )
+    const hydratePromises = moviesToHydrate.map((m) =>
+      tmdb
+        .get(`/movie/${m.id}`, {
+          params: {
+            append_to_response: "credits,videos,release_dates,watch/providers",
+          },
+        })
+        .then((full) =>
+          buildMovieObject(
+            full.data,
+            full.data.videos?.results || [],
+            full.data["watch/providers"]
           )
-          .catch(() => null)
-      );
+        )
+        .catch(() => null)
+    );
 
-      const batchResults = await Promise.all(batchPromises);
-      results.push(...batchResults.filter((m) => m !== null));
-    }
+    const hydratedResults = await Promise.all(hydratePromises);
+    const validResults = hydratedResults.filter((m) => m !== null && m.videoUrl);
 
-    /* --------------------------------------------------
-       🔥 FREE USER → COUNT ARTTIR
-    -------------------------------------------------- */
-    if (!isPremium) {
-      feedLimit[userIp].count += results.length;
+    // --- 3. INCREMENT LIMIT ---
+    if (!isPremium && validResults.length > 0) {
+      const incrementAmount = validResults.length;
+      const today = new Date();
+
+      if (user) {
+        // Update User
+        // Check if reset needed
+        const lastReset = new Date(user.lastResetDate);
+        const isNewDay = today.getDate() !== lastReset.getDate() ||
+          today.getMonth() !== lastReset.getMonth() ||
+          today.getFullYear() !== lastReset.getFullYear();
+
+        const newCount = isNewDay ? incrementAmount : user.dailyCount + incrementAmount;
+
+        await prisma.user.update({
+          where: { id: user.id },
+          data: {
+            dailyCount: newCount,
+            lastResetDate: today // Update date to now
+          }
+        });
+      } else {
+        // Update Guest
+        const guest = await prisma.guestUsage.findUnique({ where: { ip: userIp } });
+        // Guest should exist because we checked/created above, but safe check
+        if (guest) {
+          const lastReset = new Date(guest.lastResetDate);
+          const isNewDay = today.getDate() !== lastReset.getDate() ||
+            today.getMonth() !== lastReset.getMonth() ||
+            today.getFullYear() !== lastReset.getFullYear();
+
+          const newCount = isNewDay ? incrementAmount : guest.dailyCount + incrementAmount;
+
+          await prisma.guestUsage.update({
+            where: { ip: userIp },
+            data: {
+              dailyCount: newCount,
+              lastResetDate: today
+            }
+          });
+        }
+      }
     }
 
     return res.json({
       page,
-      seed,
-      count: results.length,
-      movies: results,
+      count: validResults.length,
+      movies: validResults,
     });
+
   } catch (err) {
     console.error("ALL FEED ERROR:", err.message);
-    return res.status(500).json({ error: "all hata verdi knk" });
+    return res.status(500).json({ error: "Sunucu hatası knk" });
   }
 });
 

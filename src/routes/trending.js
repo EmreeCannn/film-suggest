@@ -41,82 +41,77 @@ router.get("/", async (req, res) => {
       return res.json({ ...cached, cached: true });
     }
 
-    // 1) Trending 30 film getir
+    // 1) Trending 20 film getir (Limit to 20 to be safe)
     const trendingRes = await tmdb.get("/trending/movie/day");
-    const movies = trendingRes.data.results.slice(0, 30);
+    const movies = trendingRes.data.results.slice(0, 20);
 
-    // 2) Paralel full detay çekme
+    // 2) Paralel full detay çekme (Optimized with append_to_response)
     const feed = await Promise.all(
       movies.map(async (movie) => {
-        const movieId = movie.id;
+        try {
+          const fullRes = await tmdb.get(`/movie/${movie.id}`, {
+            params: {
+              append_to_response: "credits,videos,release_dates,watch/providers"
+            }
+          });
 
-        const [
-          detailsRes,
-          creditsRes,
-          releaseRes,
-          videosRes,
-          providersRes,
-        ] = await Promise.all([
-          tmdb.get(`/movie/${movieId}`),
-          tmdb.get(`/movie/${movieId}/credits`),
-          tmdb.get(`/movie/${movieId}/release_dates`),
-          tmdb.get(`/movie/${movieId}/videos`),
-          tmdb.get(`/movie/${movieId}/watch/providers`),
-        ]);
+          const d = fullRes.data;
+          const credits = d.credits || {};
+          const videosRes = d.videos || {};
+          const releaseRes = d.release_dates || {};
+          const providersRes = d["watch/providers"] || {};
 
-        const d = detailsRes.data;
+          // 🎭 CAST
+          const cast = (credits.cast || []).slice(0, 10).map((p) => ({
+            name: p.name,
+            character: p.character,
+            profile: p.profile_path
+              ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
+              : null,
+          }));
 
-        // 🎭 CAST
-        const cast = creditsRes.data.cast.slice(0, 10).map((p) => ({
-          name: p.name,
-          character: p.character,
-          profile: p.profile_path
-            ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
-            : null,
-        }));
+          // 🎬 DIRECTOR
+          const director =
+            (credits.crew || []).find((p) => p.job === "Director")?.name || null;
 
-        // 🎬 DIRECTOR
-        const director =
-          creditsRes.data.crew.find((p) => p.job === "Director")?.name || null;
+          // 🔞 CERTIFICATION
+          const certification =
+            releaseRes.results
+              ?.find((r) => r.iso_3166_1 === "US")
+              ?.release_dates?.[0]?.certification || null;
 
-        // 🔞 CERTIFICATION
-        const certification =
-          releaseRes.data.results
-            ?.find((r) => r.iso_3166_1 === "US")
-            ?.release_dates?.[0]?.certification || null;
+          // 🎞 VIDEO
+          const videos = videosRes.results || [];
+          let videoUrl = null;
+          let videoSource = null;
 
-        // 🎞 VIDEO
-        const videos = videosRes.data.results || [];
-        let videoUrl = null;
-        let videoSource = null;
-
-        const tmdbMp4 = videos.find(
-          (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
-        );
-
-        if (tmdbMp4) {
-          videoUrl = tmdbMp4.url;
-          videoSource = "tmdb_mp4";
-        } else {
-          const yt = videos.find(
-            (v) => v.site === "YouTube" && v.type === "Trailer"
+          const tmdbMp4 = videos.find(
+            (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
           );
-          if (yt) {
-            videoUrl = convertToWatchUrl(yt.key);
-            videoSource = "youtube";
+
+          if (tmdbMp4) {
+            videoUrl = tmdbMp4.url;
+            videoSource = "tmdb_mp4";
+          } else {
+            const yt = videos.find(
+              (v) => v.site === "YouTube" && v.type === "Trailer"
+            );
+            if (yt) {
+              videoUrl = convertToWatchUrl(yt.key);
+              videoSource = "youtube";
+            }
           }
-        }
 
-        // Trailer yoksa film ekleme
-        if (!videoUrl) return null;
+          // Trailer yoksa film ekleme
+          if (!videoUrl) return null;
 
-        // 📡 PROVIDERS
-        const us = providersRes.data.results?.US || {};
+          // 📡 PROVIDERS
+          const us = providersRes.results?.US || {};
 
-        const mapProviders = (list, type) =>
-          !list
-            ? []
-            : list.map((p) => ({
+          const mapProviders = (list, type) =>
+            !list
+              ? []
+              : list.map((p) => ({
                 name: p.provider_name,
                 type,
                 logo: p.logo_path
@@ -124,35 +119,38 @@ router.get("/", async (req, res) => {
                   : null,
               }));
 
-        const platforms = [
-          ...mapProviders(us.flatrate, "subscription"),
-          ...mapProviders(us.buy, "buy"),
-          ...mapProviders(us.rent, "rent"),
-          ...mapProviders(us.ads, "ads"),
-        ];
+          const platforms = [
+            ...mapProviders(us.flatrate, "subscription"),
+            ...mapProviders(us.buy, "buy"),
+            ...mapProviders(us.rent, "rent"),
+            ...mapProviders(us.ads, "ads"),
+          ];
 
-        return {
-          id: movieId,
-          title: d.title,
-          overview: d.overview,
-          year: d.release_date?.split("-")[0] || "N/A",
-          rating: d.vote_average,
-          runtime: d.runtime,
-          certification,
-          director,
-          genres: d.genres?.map((g) => g.name) || [],
-          cast,
-          poster: d.poster_path
-            ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
-            : null,
-          backdrop: d.backdrop_path
-            ? `https://image.tmdb.org/t/p/w780${d.backdrop_path}`
-            : null,
-          platforms,
-          platformLink: us.link || null,
-          videoUrl,
-          videoSource,
-        };
+          return {
+            id: movie.id,
+            title: d.title,
+            overview: d.overview,
+            year: d.release_date?.split("-")[0] || "N/A",
+            rating: d.vote_average,
+            runtime: d.runtime,
+            certification,
+            director,
+            genres: d.genres?.map((g) => g.name) || [],
+            cast,
+            poster: d.poster_path
+              ? `https://image.tmdb.org/t/p/w500${d.poster_path}`
+              : null,
+            backdrop: d.backdrop_path
+              ? `https://image.tmdb.org/t/p/w780${d.backdrop_path}`
+              : null,
+            platforms,
+            platformLink: us.link || null,
+            videoUrl,
+            videoSource,
+          };
+        } catch (e) {
+          return null;
+        }
       })
     );
 

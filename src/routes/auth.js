@@ -54,6 +54,36 @@ export const authMiddleware = async (req, res, next) => {
   }
 };
 
+export const optionalAuthMiddleware = async (req, res, next) => {
+  try {
+    const header = req.headers.authorization;
+    if (!header) {
+      req.user = null;
+      return next();
+    }
+
+    const token = header.replace("Bearer ", "");
+    // If token is empty or just "Bearer ", treat as guest
+    if (!token || token.trim() === "") {
+      req.user = null;
+      return next();
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id }
+    });
+
+    req.user = user || null;
+    next();
+  } catch (err) {
+    // Token error -> treat as guest
+    req.user = null;
+    next();
+  }
+};
+
 /* ============================================
    REGISTER
 =============================================== */
