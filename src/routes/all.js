@@ -4,6 +4,12 @@ import { tmdb } from "../services/tmdb.js";
 const router = express.Router();
 
 /* ---------------------------------------------
+   DAILY FREEMIUM LIMIT (20 FILM / DAY)
+--------------------------------------------- */
+const feedLimit = {}; 
+const ONE_DAY = 24 * 60 * 60 * 1000;
+
+/* ---------------------------------------------
    YOUTUBE → WATCH FORMAT
 --------------------------------------------- */
 function convertToWatchUrl(idOrUrl) {
@@ -114,16 +120,43 @@ function buildMovieObject(data, videos, providers) {
 --------------------------------------------- */
 router.get("/", async (req, res) => {
   try {
-    const page = Number(req.query.page) || 1;
+    const userIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
+    const user = req.user || null;
+    const isPremium = user?.plan === "premium";
 
-    // RANDOM SEED → TikTok tarzı farklı feed için kritik
+    /* --------------------------------------------------
+       🔥 DAILY RESET
+    -------------------------------------------------- */
+    if (!feedLimit[userIp]) {
+      feedLimit[userIp] = { count: 0, lastReset: Date.now() };
+    }
+
+    const diff = Date.now() - feedLimit[userIp].lastReset;
+    if (diff > ONE_DAY) {
+      feedLimit[userIp].count = 0;
+      feedLimit[userIp].lastReset = Date.now();
+    }
+
+    /* --------------------------------------------------
+       🔥 LIMIT KONTROLÜ (EN BAŞA ÇEKİLDİ)
+    -------------------------------------------------- */
+    if (!isPremium && feedLimit[userIp].count >= 20) {
+      return res.status(403).json({
+        error: "Günlük 20 film limitini doldurdun knk.",
+        limit: 20,
+        resetIn: ONE_DAY - diff,
+      });
+    }
+
+    /* --------------------------------------------------
+       FETCH BAŞLIYOR
+    -------------------------------------------------- */
+    const page = Number(req.query.page) || 1;
     const seed = Math.floor(Math.random() * 999999);
 
-    // 1 client page = 10 tmdb page (200 film)
     const startTmdbPage = (page - 1) * 10 + 1;
     const endTmdbPage = startTmdbPage + 9;
 
-    // Discover fetch
     const discoverPromises = [];
     for (let i = startTmdbPage; i <= endTmdbPage; i++) {
       discoverPromises.push(
@@ -134,10 +167,7 @@ router.get("/", async (req, res) => {
             include_adult: false,
             vote_count_gte: 200,
             "with_watch_monetization_types": "flatrate|rent|buy",
-
-            // RANDOM FEED SEED TRICK
             without_keywords: seed,
-
             primary_release_date_gte: "1990-01-01",
             with_original_language: "en",
           },
@@ -148,7 +178,6 @@ router.get("/", async (req, res) => {
     const discoverResponses = await Promise.all(discoverPromises);
     let movies = discoverResponses.flatMap((r) => r.data.results);
 
-    // Basic filter
     movies = movies.filter(
       (m) =>
         m.poster_path &&
@@ -157,10 +186,8 @@ router.get("/", async (req, res) => {
         m.vote_average > 0
     );
 
-    // Random shuffle → TikTok feed hissi
     movies = movies.sort(() => Math.random() - 0.5);
 
-    // Full detail fetch (20'şer paket)
     const results = [];
     const BATCH_SIZE = 20;
 
@@ -186,6 +213,13 @@ router.get("/", async (req, res) => {
 
       const batchResults = await Promise.all(batchPromises);
       results.push(...batchResults.filter((m) => m !== null));
+    }
+
+    /* --------------------------------------------------
+       🔥 FREE USER → COUNT ARTTIR
+    -------------------------------------------------- */
+    if (!isPremium) {
+      feedLimit[userIp].count += results.length;
     }
 
     return res.json({
