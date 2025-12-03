@@ -4,6 +4,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
+    "build": "prisma generate",
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node index.js"
   },
@@ -12,7 +13,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@prisma/client": "^6.7.0",
+    "@prisma/client": "^5.15.0",
     "apple-signin-auth": "^2.0.0",
     "axios": "^1.13.2",
     "bcryptjs": "^3.0.3",
@@ -24,7 +25,7 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "node-cache": "^5.1.2",
-    "prisma": "^6.7.0",
+    "prisma": "^5.15.0",
     "serverless-http": "^4.0.0",
     "uuid": "^13.0.0"
   },

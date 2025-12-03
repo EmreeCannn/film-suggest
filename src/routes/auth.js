@@ -151,47 +151,47 @@ router.post("/google", async (req, res) => {
 /* ============================================
    APPLE SIGN-IN (hazır ama client ID yoksa çalışmaz)
 =============================================== */
-router.post("/apple", async (req, res) => {
-  try {
-    const { idToken } = req.body;
+// router.post("/apple", async (req, res) => {
+//   try {
+//     const { idToken } = req.body;
 
-    if (!APPLE_CLIENT_ID)
-      return res.status(500).json({ error: "APPLE_CLIENT_ID tanımlı değil" });
+//     if (!APPLE_CLIENT_ID)
+//       return res.status(500).json({ error: "APPLE_CLIENT_ID tanımlı değil" });
 
-    if (!idToken)
-      return res.status(400).json({ error: "idToken gerekli." });
+//     if (!idToken)
+//       return res.status(400).json({ error: "idToken gerekli." });
 
-    const decoded = await appleSignin.verifyIdToken(idToken, {
-      audience: APPLE_CLIENT_ID,
-      ignoreExpiration: false
-    });
+//     const decoded = await appleSignin.verifyIdToken(idToken, {
+//       audience: APPLE_CLIENT_ID,
+//       ignoreExpiration: false
+//     });
 
-    const appleId = decoded.sub;
-    const email = decoded.email ?? null;
+//     const appleId = decoded.sub;
+//     const email = decoded.email ?? null;
 
-    let user = await prisma.user.findUnique({ where: { appleId } });
+//     let user = await prisma.user.findUnique({ where: { appleId } });
 
-    if (!user && email) {
-      user = await prisma.user.findUnique({ where: { email } });
-    }
+//     if (!user && email) {
+//       user = await prisma.user.findUnique({ where: { email } });
+//     }
 
-    if (!user) {
-      user = await prisma.user.create({
-        data: { appleId, email }
-      });
-    } else if (!user.appleId) {
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: { appleId }
-      });
-    }
+//     if (!user) {
+//       user = await prisma.user.create({
+//         data: { appleId, email }
+//       });
+//     } else if (!user.appleId) {
+//       user = await prisma.user.update({
+//         where: { id: user.id },
+//         data: { appleId }
+//       });
+//     }
 
-    return res.json({ user, token: createToken(user) });
-  } catch (err) {
-    console.error("APPLE LOGIN ERR:", err);
-    return res.status(500).json({ error: "Apple giriş hatası" });
-  }
-});
+//     return res.json({ user, token: createToken(user) });
+//   } catch (err) {
+//     console.error("APPLE LOGIN ERR:", err);
+//     return res.status(500).json({ error: "Apple giriş hatası" });
+//   }
+// });
 
 /* ============================================
    PREMIUM UPGRADE (Apple Pay veya Google IAP sonrası)
