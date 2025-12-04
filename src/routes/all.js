@@ -5,87 +5,34 @@ import { optionalAuthMiddleware } from "./auth.js";
 
 const router = express.Router();
 
-/* ---------------------------------------------
-   YOUTUBE → WATCH FORMAT
---------------------------------------------- */
-function convertToWatchUrl(idOrUrl) {
-  if (!idOrUrl) return null;
+/* ---------------------- HELPERS ---------------------- */
+function isToday(date) {
+  const d = new Date(date);
+  const t = new Date();
+  return (
+    d.getDate() === t.getDate() &&
+    d.getMonth() === t.getMonth() &&
+    d.getFullYear() === t.getFullYear()
+  );
+}
 
-  if (!idOrUrl.includes("youtube"))
-    return `https://www.youtube.com/watch?v=${idOrUrl}`;
+function convertToWatchUrl(raw) {
+  if (!raw) return null;
+  if (!raw.includes("youtube"))
+    return `https://www.youtube.com/watch?v=${raw}`;
 
-  const idFromEmbed = idOrUrl.match(/embed\/([^?]+)/);
-  if (idFromEmbed) return `https://www.youtube.com/watch?v=${idFromEmbed[1]}`;
+  const embed = raw.match(/embed\/([^?]+)/);
+  if (embed) return `https://www.youtube.com/watch?v=${embed[1]}`;
 
-  const idFromWatch = idOrUrl.match(/watch\\?v=([^&]+)/);
-  if (idFromWatch) return `https://www.youtube.com/watch?v=${idFromWatch[1]}`;
+  const w = raw.match(/watch\\?v=([^&]+)/);
+  if (w) return `https://www.youtube.com/watch?v=${w[1]}`;
 
   return null;
 }
 
-/* ---------------------------------------------
-    TEK FİLM OBJECT (FORMAT BOZULMADAN)
---------------------------------------------- */
-function buildMovieObject(data, videos, providers) {
-  const cast = (data.credits?.cast || [])
-    .slice(0, 10)
-    .map((p) => ({
-      name: p.name,
-      character: p.character,
-      profile: p.profile_path
-        ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
-        : null,
-    }));
-
-  const director =
-    (data.credits?.crew || []).find((p) => p.job === "Director")?.name || null;
-
-  const certification =
-    data.release_dates?.results
-      ?.find((r) => r.iso_3166_1 === "US")
-      ?.release_dates?.[0]?.certification || null;
-
-  let videoUrl = null;
-  let videoSource = null;
-
-  const tmdbMp4 = videos.find(
-    (v) => v.site === "TMDB" && v.url?.endsWith(".mp4")
-  );
-
-  if (tmdbMp4) {
-    videoUrl = tmdbMp4.url;
-    videoSource = "tmdb_mp4";
-  } else {
-    const yt = videos.find(
-      (v) => v.site === "YouTube" && v.type === "Trailer"
-    );
-    if (yt) {
-      videoUrl = convertToWatchUrl(yt.key);
-      videoSource = "youtube";
-    }
-  }
-
-  if (!videoUrl) return null;
-
-  const us = providers?.results?.US || {};
-
-  const mapProviders = (list, type) =>
-    !list
-      ? []
-      : list.map((p) => ({
-        name: p.provider_name,
-        type,
-        logo: p.logo_path
-          ? `https://image.tmdb.org/t/p/w500${p.logo_path}`
-          : null,
-      }));
-
-  const platforms = [
-    ...mapProviders(us.flatrate, "subscription"),
-    ...mapProviders(us.buy, "buy"),
-    ...mapProviders(us.rent, "rent"),
-    ...mapProviders(us.ads, "ads"),
-  ];
+function buildMovie(data, videos) {
+  const yt = videos.find(v => v.site === "YouTube" && v.type === "Trailer");
+  if (!yt) return null;
 
   return {
     id: data.id,
@@ -94,187 +41,176 @@ function buildMovieObject(data, videos, providers) {
     year: data.release_date?.split("-")[0] || "N/A",
     rating: data.vote_average,
     runtime: data.runtime,
-    certification,
-    director,
-    genres: data.genres?.map((g) => g.name) || [],
-    cast,
+    certification:
+      data.release_dates?.results
+        ?.find(r => r.iso_3166_1 === "US")
+        ?.release_dates?.[0]?.certification || null,
+    director:
+      (data.credits?.crew || []).find(c => c.job === "Director")?.name || null,
+    genres: data.genres?.map(g => g.name) || [],
+    cast: (data.credits?.cast || []).slice(0, 10).map(p => ({
+      name: p.name,
+      character: p.character,
+      profile: p.profile_path
+        ? `https://image.tmdb.org/t/p/w500${p.profile_path}`
+        : null,
+    })),
     poster: data.poster_path
       ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
       : null,
     backdrop: data.backdrop_path
       ? `https://image.tmdb.org/t/p/w780${data.backdrop_path}`
       : null,
-    platforms,
-    platformLink: us.link || null,
-    videoUrl,
-    videoSource,
+    platforms: [],
+    platformLink: null,
+    videoUrl: convertToWatchUrl(yt.key),
+    videoSource: "youtube",
   };
 }
 
-// Apply middleware to all routes in this router
+/* ---------------------- MAIN ---------------------- */
 router.use(optionalAuthMiddleware);
 
-/* ---------------------------------------------
-    /api/all?page=X  (TIKTOK RANDOM FEED)
---------------------------------------------- */
 router.get("/", async (req, res) => {
   try {
-    const userIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
-    const user = req.user; // Populated by optionalAuthMiddleware
-    const isPremium = user?.plan === "premium";
-    const LIMIT = 20;
+    const LIMIT = 30;
+    const MAX_PER_REQUEST = 10;
 
-    // --- 1. LIMIT CHECK ---
-    if (!isPremium) {
-      let currentCount = 0;
-      let lastReset = new Date();
+    let isPremium = false;
+    let dailyCount = 0;
+    let lastReset = new Date();
+    let userId = null;
 
-      if (user) {
-        // Logged in Free User
-        currentCount = user.dailyCount;
-        lastReset = user.lastResetDate;
-      } else {
-        // Guest User
-        let guest = await prisma.guestUsage.findUnique({ where: { ip: userIp } });
-        if (!guest) {
-          guest = await prisma.guestUsage.create({ data: { ip: userIp } });
-        }
-        currentCount = guest.dailyCount;
-        lastReset = guest.lastResetDate;
-      }
+    /* ---------------- USER ---------------- */
+    if (req.user) {
+      const fresh = await prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { plan: true, dailyCount: true, lastResetDate: true },
+      });
 
-      // Check date reset
-      const today = new Date();
-      if (
-        today.getDate() !== lastReset.getDate() ||
-        today.getMonth() !== lastReset.getMonth() ||
-        today.getFullYear() !== lastReset.getFullYear()
-      ) {
-        // Reset needed (will be done during increment, but logically count is 0 now)
-        currentCount = 0;
-      }
-
-      if (currentCount >= LIMIT) {
-        return res.status(403).json({
-          error: "Günlük 20 film limitini doldurdun knk.",
-          limit: LIMIT,
-          isPremium: false
-        });
+      if (fresh) {
+        isPremium = fresh.plan === "premium";
+        dailyCount = fresh.dailyCount;
+        lastReset = fresh.lastResetDate;
+        userId = req.user.id;
       }
     }
 
-    // --- 2. FETCH MOVIES ---
-    // Optimize: Fetch only 1 page (20 items) based on random seed or client page
-    const page = Number(req.query.page) || 1;
-    // Use a random page offset to keep it fresh if page=1 is requested repeatedly? 
-    // Or trust client to send incrementing pages. 
-    // User wants "Reels" feel, so random is good.
-    // Let's use the client page but add some randomness if it's the first page.
+    /* ---------------- GUEST ---------------- */
+    let guestId = null;
 
-    // Actually, to avoid duplicates, we should respect the page number.
-    // But to make it "Reels" like, we want popular movies.
+    if (!userId) {
+      guestId = req.headers["x-guest-id"];
 
-    const tmdbResponse = await tmdb.get("/discover/movie", {
-      params: {
-        sort_by: "popularity.desc",
-        page: page,
-        include_adult: false,
-        vote_count_gte: 100,
-        "with_watch_monetization_types": "flatrate|rent|buy",
-        with_original_language: "en",
-      },
-    });
+      if (!guestId) {
+        return res.status(400).json({
+          error: "x-guest-id header gerekli knk (örnek: test1234)",
+        });
+      }
 
-    let movies = tmdbResponse.data.results || [];
+      let guest = await prisma.guest.findUnique({ where: { id: guestId } });
 
-    // Filter basic requirements
-    movies = movies.filter(
-      (m) =>
-        m.poster_path &&
-        m.backdrop_path &&
-        m.overview?.length > 10
+      if (!guest) {
+        guest = await prisma.guest.create({
+          data: { id: guestId },
+        });
+      }
+
+      dailyCount = guest.dailyCount;
+      lastReset = guest.lastReset;
+    }
+
+    /* ---------------- RESET COUNTER ---------------- */
+    if (!isToday(lastReset)) {
+      dailyCount = 0;
+    }
+
+    /* ---------------- LIMIT BLOCK ---------------- */
+    if (!isPremium && dailyCount >= LIMIT) {
+      return res.status(403).json({
+        error: "Günlük 30 film limitini doldurdun knk.",
+        limit: LIMIT,
+        remaining: 0,
+        isPremium: false,
+      });
+    }
+
+   /* ---------------- FETCH MOVIES ---------------- */
+const page = Number(req.query.page) || 1;
+
+const seedId = userId || guestId;
+const seedNum = [...seedId].reduce((s, c) => s + c.charCodeAt(0), 0);
+
+// kullanıcıya özel random page
+const randomPage = ((page * 37 + seedNum) % 500) + 1;
+
+const tmdbRes = await tmdb.get("/discover/movie", {
+  params: {
+    sort_by: "popularity.desc",
+    include_adult: false,
+    page: randomPage,
+    vote_count_gte: 100,
+    with_original_language: "en",
+  },
+});
+
+let movies = tmdbRes.data.results.filter(
+  (m) => m.poster_path && m.backdrop_path && m.overview?.length > 10
+);
+
+    /* ---------------- HYDRATE ---------------- */
+    const hydrateCount = isPremium
+      ? Math.min(20, movies.length)
+      : Math.min(MAX_PER_REQUEST, LIMIT - dailyCount);
+
+    const hydrated = await Promise.all(
+      movies.slice(0, hydrateCount).map(m =>
+        tmdb
+          .get(`/movie/${m.id}`, {
+            params: {
+              append_to_response:
+                "credits,videos,release_dates,watch/providers",
+            },
+          })
+          .then(full => buildMovie(full.data, full.data.videos?.results || []))
+          .catch(() => null)
+      )
     );
 
-    // Shuffle slightly
-    movies = movies.sort(() => Math.random() - 0.5);
+    const finalMovies = hydrated.filter(Boolean);
 
-    // Limit to 5-10 to prevent timeout during hydration
-    // Hydrating 20 movies takes time. Let's try 10.
-    const moviesToHydrate = movies.slice(0, 10);
+    /* ---------------- UPDATE LIMIT ---------------- */
+    const increase = finalMovies.length;
 
-    const hydratePromises = moviesToHydrate.map((m) =>
-      tmdb
-        .get(`/movie/${m.id}`, {
-          params: {
-            append_to_response: "credits,videos,release_dates,watch/providers",
-          },
-        })
-        .then((full) =>
-          buildMovieObject(
-            full.data,
-            full.data.videos?.results || [],
-            full.data["watch/providers"]
-          )
-        )
-        .catch(() => null)
-    );
+    if (!isPremium && increase > 0) {
+      const now = new Date();
+      const newCount = dailyCount + increase;
 
-    const hydratedResults = await Promise.all(hydratePromises);
-    const validResults = hydratedResults.filter((m) => m !== null && m.videoUrl);
-
-    // --- 3. INCREMENT LIMIT ---
-    if (!isPremium && validResults.length > 0) {
-      const incrementAmount = validResults.length;
-      const today = new Date();
-
-      if (user) {
-        // Update User
-        // Check if reset needed
-        const lastReset = new Date(user.lastResetDate);
-        const isNewDay = today.getDate() !== lastReset.getDate() ||
-          today.getMonth() !== lastReset.getMonth() ||
-          today.getFullYear() !== lastReset.getFullYear();
-
-        const newCount = isNewDay ? incrementAmount : user.dailyCount + incrementAmount;
-
+      if (userId) {
         await prisma.user.update({
-          where: { id: user.id },
-          data: {
-            dailyCount: newCount,
-            lastResetDate: today // Update date to now
-          }
+          where: { id: userId },
+          data: { dailyCount: newCount, lastResetDate: now },
         });
       } else {
-        // Update Guest
-        const guest = await prisma.guestUsage.findUnique({ where: { ip: userIp } });
-        // Guest should exist because we checked/created above, but safe check
-        if (guest) {
-          const lastReset = new Date(guest.lastResetDate);
-          const isNewDay = today.getDate() !== lastReset.getDate() ||
-            today.getMonth() !== lastReset.getMonth() ||
-            today.getFullYear() !== lastReset.getFullYear();
-
-          const newCount = isNewDay ? incrementAmount : guest.dailyCount + incrementAmount;
-
-          await prisma.guestUsage.update({
-            where: { ip: userIp },
-            data: {
-              dailyCount: newCount,
-              lastResetDate: today
-            }
-          });
-        }
+        await prisma.guest.update({
+          where: { id: guestId },
+          data: { dailyCount: newCount, lastReset: now },
+        });
       }
     }
 
+    /* ---------------- RETURN ---------------- */
     return res.json({
       page,
-      count: validResults.length,
-      movies: validResults,
+      count: finalMovies.length,
+      movies: finalMovies,
+      limit: isPremium ? null : LIMIT,
+      remaining: isPremium ? null : LIMIT - (dailyCount + increase),
+      isPremium,
+      hasMore: isPremium || dailyCount + increase < LIMIT,
     });
-
   } catch (err) {
-    console.error("ALL FEED ERROR:", err.message);
+    console.error("ALL FEED ERROR:", err);
     return res.status(500).json({ error: "Sunucu hatası knk" });
   }
 });

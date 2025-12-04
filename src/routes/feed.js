@@ -1,13 +1,31 @@
 import express from "express";
-import NodeCache from "node-cache";
 import { tmdb } from "../services/tmdb.js";
+import { optionalAuthMiddleware } from "./auth.js";
+import { v4 as uuidv4 } from "uuid";
 
 const router = express.Router();
 
-const feedCache = new NodeCache({
-  stdTTL: 300,
-  checkperiod: 320,
-});
+// Apply middleware to all routes in this router
+router.use(optionalAuthMiddleware);
+
+/* ---------------------------------------------
+   GUEST ID HELPER (Cookie-based)
+--------------------------------------------- */
+function getOrCreateGuestId(req, res) {
+  let guestId = req.cookies?.fs_guest_id;
+
+  if (!guestId || typeof guestId !== 'string' || guestId.trim() === '') {
+    guestId = uuidv4();
+    res.cookie("fs_guest_id", guestId, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 365 * 24 * 60 * 60 * 1000, // 1 year
+    });
+  }
+
+  return guestId;
+}
 
 // Embed → Watch dönüştüren fonksiyon
 function convertToWatchUrl(youtubeIdOrUrl) {
@@ -47,26 +65,116 @@ const GENRE_MAP = {
 
 router.get("/", async (req, res) => {
   try {
+    const user = req.user; // Populated by optionalAuthMiddleware
     const category = (req.query.category || "action").toLowerCase();
     const genreId = GENRE_MAP[category] || 28;
 
-    const cacheKey = `feed_${category}`;
-
-    const cached = feedCache.get(cacheKey);
-    if (cached) {
-      return res.json({ ...cached, cached: true });
+    // Her istekte farklı filmler için kullanıcıya özel seed + zaman bazlı varyasyon
+    let userSeed = 1;
+    let userId = null;
+    let guestId = null;
+    
+    if (user) {
+      // Logged in user - User ID'den deterministik seed
+      userId = user.id;
+      userSeed = parseInt(user.id.slice(-8), 16) % 1000 || 1;
+    } else {
+      // Guest user - Cookie-based guest ID
+      guestId = getOrCreateGuestId(req, res);
+      const guestHash = guestId.split('-').reduce((acc, part) => {
+        return acc + parseInt(part.slice(0, 4), 16) || 0;
+      }, 0);
+      userSeed = guestHash % 1000 || 1;
     }
+    
+    // Her istekte farklı filmler için: seed + zaman bazlı varyasyon + random element
+    // Bu sayede aynı kullanıcı bile farklı zamanlarda farklı filmler görür
+    const now = new Date();
+    const hourVariation = now.getHours(); // 0-23
+    const minuteVariation = now.getMinutes(); // 0-59
+    const secondVariation = Math.floor(now.getSeconds() / 5); // 0-11 (5 saniyelik bloklar)
+    const randomOffset = Math.floor(Math.random() * 100); // 0-99 random element
+    
+    // Her istekte farklı sayfa için güçlü varyasyon
+    const timeSeed = (userSeed + hourVariation * 100 + minuteVariation * 2 + secondVariation + randomOffset) % 1000;
+    
+    // Kullanıcıya özel sayfa numarası (her kullanıcı farklı yerden başlasın)
+    // Her istekte farklı sayfa için daha geniş aralık
+    const userSpecificPage = Math.floor(timeSeed / 20) + 1; // 1-50 arası sayfa
 
-    // İlk 30 popüler film
+    // Kullanıcıya özel filmler getir
     const discover = await tmdb.get("/discover/movie", {
       params: {
         with_genres: genreId,
         sort_by: "popularity.desc",
-        page: 1,
+        page: userSpecificPage,
       },
     });
 
-    const movies = discover.data.results.slice(0, 30);
+    let movies = discover.data.results || [];
+
+    // Filter basic requirements
+    movies = movies.filter(
+      (m) =>
+        m.poster_path &&
+        m.backdrop_path &&
+        m.overview?.length > 10
+    );
+
+    // Eğer yeterli film yoksa, daha fazla sayfa çek
+    let attempts = 0;
+    while (movies.length < 30 && attempts < 5) {
+      attempts++;
+      const nextPage = userSpecificPage + attempts;
+      try {
+        const nextResponse = await tmdb.get("/discover/movie", {
+          params: {
+            with_genres: genreId,
+            sort_by: "popularity.desc",
+            page: nextPage,
+          },
+        });
+        
+        const nextMovies = (nextResponse.data.results || []).filter(
+          (m) =>
+            m.poster_path &&
+            m.backdrop_path &&
+            m.overview?.length > 10
+        );
+        movies = [...movies, ...nextMovies];
+      } catch (err) {
+        console.error("Error fetching additional page:", err);
+        break;
+      }
+    }
+
+    // Kullanıcıya özel shuffle (her istekte farklı sıralama için güçlü varyasyon)
+    let shuffleSeed = 1;
+    if (userId) {
+      shuffleSeed = parseInt(userId.slice(-6), 16) + hourVariation * 100 + minuteVariation + secondVariation;
+    } else if (guestId) {
+      // UUID'den hash oluştur
+      const guestHash = guestId.split('-').reduce((acc, part) => {
+        return acc + (parseInt(part.slice(0, 4), 16) || 0);
+      }, 0);
+      shuffleSeed = (guestHash % 10000) + hourVariation * 100 + minuteVariation + secondVariation;
+    }
+    
+    const seededRandom = (seed) => {
+      const x = Math.sin(seed) * 10000;
+      return x - Math.floor(x);
+    };
+    
+    // Her istekte farklı shuffle için random offset ekle
+    const shuffleOffset = randomOffset * 1000;
+    movies = movies.sort((a, b) => {
+      const randA = seededRandom(shuffleSeed + a.id + shuffleOffset + secondVariation);
+      const randB = seededRandom(shuffleSeed + b.id + shuffleOffset + secondVariation);
+      return randA - randB;
+    });
+
+    // İlk 30 filmi al
+    movies = movies.slice(0, 30);
 
     // En ağır datayı tek seferde getir
     const feed = await Promise.all(
@@ -200,9 +308,7 @@ router.get("/", async (req, res) => {
       feed: finalFeed,
     };
 
-    feedCache.set(cacheKey, result);
-
-    return res.json({ ...result, cached: false });
+    return res.json(result);
   } catch (err) {
     console.error("FEED ERROR:", err.message);
     return res.status(500).json({ error: "Feed hata verdi knk" });

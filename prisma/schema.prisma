@@ -45,9 +45,28 @@ model User {
   updatedAt DateTime @updatedAt
 }
 
-model GuestUsage {
-  id            String   @id @default(cuid())
-  ip            String   @unique
+model Guest {
+   id            String   @id // header'dan gelen x-guest-id buraya yazılacak
   dailyCount    Int      @default(0)
-  lastResetDate DateTime @default(now())
+  lastReset     DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model GuestViewedMovie {
+  id        String @id @default(cuid())
+  guestId   String
+  movieId   Int
+  viewedAt  DateTime @default(now())
+
+  @@unique([guestId, movieId])
+}
+
+model UserViewedMovie {
+  id        String @id @default(cuid())
+  userId    String
+  movieId   Int
+  viewedAt  DateTime @default(now())
+
+  @@unique([userId, movieId])
 }

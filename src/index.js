@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import cookieParser from "cookie-parser";
 import feedRouter from "./routes/feed.js";
 import allRouter from "./routes/all.js"
 import router from "./routes/ai.js";
@@ -18,8 +19,12 @@ const app = express();
 // const prisma = new PrismaClient(); // Removed in favor of singleton import
 
 app.use(express.json());
+app.use(cookieParser());
 app.use(helmet());
-app.use(cors());
+app.use(cors({
+  credentials: true, // Cookie'ler için gerekli
+  origin: true // Tüm origin'lere izin ver (production'da spesifik origin kullan)
+}));
 app.use(rateLimit({
   windowMs: 60 * 1000,
   max: 60
